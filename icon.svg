@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="45%" stop-color="#1E3A8A"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <filter id="shadow" x="-12%" y="-12%" width="124%" height="124%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded App Squircle Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="18" y="18" width="476" height="476" rx="96" fill="none" stroke="#60A5FA" stroke-width="4" stroke-opacity="0.35"/>
+
+  <!-- Storefront & Brand Emblem (No Classic PC Monitor) -->
+  <g filter="url(#shadow)">
+    <!-- Store Body Card -->
+    <rect x="88" y="148" width="336" height="260" rx="28" fill="#FFFFFF"/>
+    <rect x="104" y="170" width="304" height="222" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="3"/>
+
+    <!-- Storefront Awning (Toldo de Tienda Comercial) -->
+    <path d="M72 148 L108 88 L404 88 L440 148 Z" fill="url(#emeraldGrad)"/>
+    <!-- Awning Stripes -->
+    <path d="M144 88 L128 148 L184 148 L192 88 Z" fill="#FFFFFF" fill-opacity="0.92"/>
+    <path d="M240 88 L236 148 L276 148 L272 88 Z" fill="#FFFFFF" fill-opacity="0.92"/>
+    <path d="M320 88 L328 148 L384 148 L368 88 Z" fill="#FFFFFF" fill-opacity="0.92"/>
+
+    <!-- Awning Scallops (Ondas del Toldo) -->
+    <circle cx="104" cy="148" r="32" fill="#059669"/>
+    <circle cx="160" cy="148" r="32" fill="#FFFFFF"/>
+    <circle cx="216" cy="148" r="32" fill="#059669"/>
+    <circle cx="256" cy="148" r="32" fill="#FFFFFF"/>
+    <circle cx="296" cy="148" r="32" fill="#059669"/>
+    <circle cx="352" cy="148" r="32" fill="#FFFFFF"/>
+    <circle cx="408" cy="148" r="32" fill="#059669"/>
+
+    <!-- Central Brand Circle with $ / POS Check -->
+    <circle cx="256" cy="272" r="74" fill="url(#bg)"/>
+    <circle cx="256" cy="272" r="64" fill="none" stroke="#38BDF8" stroke-width="3" stroke-opacity="0.5"/>
+    <text x="256" y="302" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, sans-serif" font-size="92" font-weight="900">$</text>
+
+    <!-- Gold Star / Check Badge -->
+    <circle cx="320" cy="216" r="26" fill="url(#goldGrad)" stroke="#FFFFFF" stroke-width="5"/>
+    <path d="M309 216 L317 224 L333 208" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Bottom Brand Pill -->
+    <rect x="116" y="390" width="280" height="48" rx="24" fill="url(#emeraldGrad)" stroke="#FFFFFF" stroke-width="4"/>
+    <text x="256" y="422" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, sans-serif" font-size="25" font-weight="900" letter-spacing="2">CONSOLATA POS</text>
+  </g>
+</svg>
