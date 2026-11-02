@@ -1,11 +1,8 @@
 {
   "name": "consolata-tienda-online-pwa",
+  "version": "5.67.37",
   "private": true,
-  "version": "5.64.34",
-  "description": "Frontend PWA Estático - Tienda Online La Consolata Limpieza y Anexos (Desacoplado del ERP)",
   "scripts": {
-    "build": "node build-tienda.cjs",
-    "vercel-build": "node build-tienda.cjs",
-    "start": "node build-tienda.cjs"
+    "build": "node build-tienda.cjs"
   }
 }
