@@ -2,13 +2,13 @@
   "success": true,
   "apiVersion": "1.0",
   "rev": "v5.67-20261102-R37",
-  "updatedAt": 1793734194924,
+  "updatedAt": 1793737586336,
   "storeConfig": {
     "enabled": true,
     "storeTitle": "LA CONSOLATA LIMPIEZA Y ANEXOS",
     "storeSubtitle": "Catálogo Oficial Online • Ventas por Mayor y Menor",
     "bannerMessage": "¡Armá tu pedido desde tu celular o PC y retiralo sin fila en el local o recibilo en tu domicilio!",
-    "whatsappNumber": "5493582407181",
+    "whatsappNumber": "3582407181",
     "address": "PRINGLES 467",
     "bankAlias": "CONSOLATA.LIMPIEZA",
     "bankCbu": "",
@@ -2240,7 +2240,7 @@
       "salePrice": 9200,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 1.75,
+      "stock": 1.5,
       "usesInventory": true,
       "sellType": "bulk",
       "unitOfMeasure": "KG"
@@ -5490,7 +5490,7 @@
       "salePrice": 15900,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 7,
+      "stock": 6,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -6738,7 +6738,7 @@
       "salePrice": 15900,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 7,
+      "stock": 6,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -7388,7 +7388,7 @@
       "salePrice": 3900,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 13,
+      "stock": 12,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -7986,7 +7986,7 @@
       "salePrice": 15900,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 1,
+      "stock": 0,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -18828,7 +18828,7 @@
       "salePrice": 1500,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 32,
+      "stock": 29,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -41349,7 +41349,7 @@
       "salePrice": 3500,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 1,
+      "stock": 0,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -41557,7 +41557,7 @@
       "salePrice": 2600,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 42,
+      "stock": 41,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -41804,7 +41804,7 @@
       "salePrice": 2700,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 3,
+      "stock": 2,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -44625,7 +44625,7 @@
       "salePrice": 1300,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 56,
+      "stock": 52,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -46731,7 +46731,7 @@
       "salePrice": 1300,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 24,
+      "stock": 22,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -53738,7 +53738,7 @@
       "salePrice": 1800,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 14,
+      "stock": 11,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -59069,7 +59069,7 @@
       "salePrice": 1300,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 127,
+      "stock": 126,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -78972,7 +78972,7 @@
       "salePrice": 2000,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 9,
+      "stock": 8,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -90243,7 +90243,7 @@
       "salePrice": 4000,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 2,
+      "stock": 1,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -90269,7 +90269,7 @@
       "salePrice": 4500,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 10,
+      "stock": 9,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -90321,7 +90321,7 @@
       "salePrice": 6000,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 3,
+      "stock": 2,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"

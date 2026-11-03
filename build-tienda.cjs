@@ -53,7 +53,7 @@ function fetchUrlBuffer(url) {
     VITE_STORE_ONLY: 'true',
     VITE_DEFAULT_VIEW: 'tienda',
     VITE_TIENDA_SLUG: 'consolatalimpieza',
-    VITE_ERP_API_URL: 'https://ais-pre-oron74v33fwvgprqtdsqts-654305302959.us-west2.run.app',
+    VITE_ERP_API_URL: '',
     VITE_FIREBASE_PROJECT_ID: 'angular-marking-fxctm',
     VITE_FIREBASE_APP_ID: '1:583902617780:web:7c3c93a3b31804bd3a77e1',
     VITE_FIREBASE_API_KEY: 'AIzaSyBJmooQg1-lbRswYU4PhMec5v_FhYhAxh0',
@@ -85,7 +85,7 @@ function fetchUrlBuffer(url) {
     }
   }
 
-  const baseUrl = (envVars.VITE_ERP_API_URL || 'https://ais-pre-oron74v33fwvgprqtdsqts-654305302959.us-west2.run.app').replace(/\/$/, '');
+  const baseUrl = (envVars.VITE_ERP_API_URL || '').replace(/\/$/, '');
 
   const candidateAssetDirs = [
     rootDir,
