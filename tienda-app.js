@@ -54739,9 +54739,12 @@ Push a new order from the online store into the Cloud Mailbox (/online_orders).
 Works whether the user is on Vercel, Netlify, or local preview!
 */
 async function pushOrderToCloudQueue(order) {
-	const orderId = `order_${order.folio}_${Date.now()}`;
+	const orderId = `order_${String(order.folio || "WEB").replace(/[^a-zA-Z0-9_\-]/g, "_")}_${Date.now()}`;
 	const fullPayload = {
 		...order,
+		folio: String(order.folio || "WEB"),
+		customerName: String(order.customerName || "Cliente Web"),
+		total: Number(order.total || 0),
 		status: "pending"
 	};
 	try {
@@ -54755,7 +54758,8 @@ async function pushOrderToCloudQueue(order) {
 		}
 	} catch {}
 	try {
-		await setDoc(doc(db, "online_orders", orderId), fullPayload);
+		const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(/* @__PURE__ */ new Error("Firestore timeout")), 2e3));
+		await Promise.race([setDoc(doc(db, "online_orders", orderId), fullPayload), timeoutPromise]);
 		return {
 			success: true,
 			id: orderId
