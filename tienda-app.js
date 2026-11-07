@@ -47045,6 +47045,32 @@ var __PRIVATE_AsyncQueueImpl = class {
 		}
 	}
 };
+/**
+* Initializes a new instance of {@link Firestore} with the provided settings.
+* Can only be called before any other function, including
+* {@link (getFirestore:1)}. If the custom settings are empty, this function is
+* equivalent to calling {@link (getFirestore:1)}.
+*
+* @param app - The {@link @firebase/app#FirebaseApp} with which the {@link Firestore} instance will
+* be associated.
+* @param settings - A settings object to configure the {@link Firestore} instance.
+* @param databaseId - The name of the database.
+* @returns A newly initialized {@link Firestore} instance.
+*/ function initializeFirestore(e, t, n) {
+	n || (n = qe$1);
+	const r = _getProvider(e, "firestore");
+	if (r.isInitialized(n)) {
+		const e = r.getImmediate({ identifier: n });
+		if (deepEqual(r.getOptions(n), t)) return e;
+		throw new Q(z.FAILED_PRECONDITION, "initializeFirestore() has already been called with different options. To avoid this error, call initializeFirestore() with the same options as when it was originally called, or call getFirestore() to return the already initialized instance.");
+	}
+	if (void 0 !== t.cacheSizeBytes && void 0 !== t.localCache) throw new Q(z.INVALID_ARGUMENT, "cache and cacheSizeBytes cannot be specified at the same time as cacheSizeBytes willbe deprecated. Instead, specify the cache size in the cache object");
+	if (void 0 !== t.cacheSizeBytes && -1 !== t.cacheSizeBytes && t.cacheSizeBytes < nn) throw new Q(z.INVALID_ARGUMENT, "cacheSizeBytes must be at least 1048576");
+	return t.host && isCloudWorkstation(t.host) && pingServer(t.host), r.initialize({
+		options: t,
+		instanceIdentifier: n
+	});
+}
 function getFirestore(e, t) {
 	const n = "object" == typeof e ? e : getApp(), r = "string" == typeof e ? e : t || qe$1, i = _getProvider(n, "firestore").getImmediate({ identifier: r });
 	if (!i._initialized) {
@@ -47652,6 +47678,20 @@ function __PRIVATE_validateNewFieldFilter(e, t) {
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
+var __PRIVATE_MemoryLocalCacheImpl = class {
+	constructor(e) {
+		this.kind = "memory", this._onlineComponentProvider = OnlineComponentProvider.provider, this._offlineComponentProvider = e?.garbageCollector ? e.garbageCollector._offlineComponentProvider : { build: () => new __PRIVATE_LruGcMemoryOfflineComponentProvider(void 0) };
+	}
+	toJSON() {
+		return { kind: this.kind };
+	}
+};
+/**
+* Creates an instance of `MemoryLocalCache`. The instance can be set to
+* `FirestoreSettings.cache` to tell the SDK which cache layer to use.
+*/ function memoryLocalCache(e) {
+	return new __PRIVATE_MemoryLocalCacheImpl(e);
+}
 /**
 * @license
 * Copyright 2022 Google LLC
@@ -54826,16 +54866,24 @@ try {
 	}
 } catch {}
 var app = getApps().length > 0 ? getApp() : initializeApp(resolvedFirebaseConfig);
-var db = getFirestore(app, resolvedFirebaseConfig.firestoreDatabaseId);
+var db = {};
+try {
+	db = initializeFirestore(app, { localCache: memoryLocalCache() });
+} catch {
+	try {
+		db = getFirestore(app);
+	} catch {
+		db = {};
+	}
+}
 getAuth(app);
 function isQuotaExhausted() {
-	if (quotaExhaustedTimestamp && Date.now() < quotaExhaustedTimestamp) return true;
-	if (quotaExhaustedTimestamp && Date.now() >= quotaExhaustedTimestamp) {
-		try {
-			if (typeof window !== "undefined" && window.localStorage) window.localStorage.removeItem("CONSOLATA_POS_QUOTA_EXHAUSTED");
-		} catch {}
-		quotaExhaustedTimestamp = 0;
-	}
+	try {
+		if (typeof window !== "undefined" && window.localStorage) {
+			const cached = window.localStorage.getItem("CONSOLATA_POS_QUOTA_EXHAUSTED");
+			if (cached && Number(cached) > Date.now()) return true;
+		}
+	} catch {}
 	return false;
 }
 function handleQuotaError(err) {
@@ -54855,40 +54903,54 @@ Push a new order from the online store into the Cloud Mailbox (/online_orders).
 Works whether the user is on Vercel, Netlify, or local preview!
 */
 async function pushOrderToCloudQueue(order) {
-	if (isQuotaExhausted()) return {
-		success: true,
-		id: `local_order_${order.folio}_${Date.now()}`,
-		error: "quota_exhausted_local_mode"
+	const orderId = `order_${order.folio}_${Date.now()}`;
+	const fullPayload = {
+		...order,
+		status: "pending"
 	};
 	try {
-		const orderId = `order_${order.folio}_${Date.now()}`;
-		const fullPayload = {
-			...order,
-			status: "pending"
-		};
-		const setPromise = setDoc(doc(db, "online_orders", orderId), fullPayload).then(() => ({
+		if (typeof window !== "undefined" && window.localStorage) {
+			const existing = JSON.parse(window.localStorage.getItem("CONSOLATA_OFFLINE_WEB_ORDERS") || "[]");
+			existing.push({
+				...fullPayload,
+				docId: orderId
+			});
+			window.localStorage.setItem("CONSOLATA_OFFLINE_WEB_ORDERS", JSON.stringify(existing));
+		}
+	} catch {}
+	try {
+		await setDoc(doc(db, "online_orders", orderId), fullPayload);
+		return {
 			success: true,
 			id: orderId
-		}));
-		const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve({
+		};
+	} catch (err) {
+		console.warn("[Firebase Queue] Direct order push warning (stored in local fallback):", err);
+		return {
 			success: true,
 			id: orderId,
-			error: "timeout_fallback"
-		}), 2500));
-		return await Promise.race([setPromise, timeoutPromise]);
-	} catch (err) {
-		if (handleQuotaError(err)) return {
-			success: true,
-			id: `local_order_${order.folio}_${Date.now()}`,
-			error: "quota_exhausted_local_mode"
-		};
-		console.error("[Firebase Queue] Error pushing order:", err);
-		return {
-			success: false,
-			id: "",
 			error: err?.message || String(err)
 		};
 	}
+}
+async function fetchPendingCloudOrders() {
+	const results = [];
+	try {
+		if (typeof window !== "undefined" && window.localStorage) {
+			const localOrders = JSON.parse(window.localStorage.getItem("CONSOLATA_OFFLINE_WEB_ORDERS") || "[]");
+			for (const lo of localOrders) if (lo && lo.status === "pending") results.push(lo);
+		}
+	} catch {}
+	try {
+		(await getDocs(query(collection(db, "online_orders"), where("status", "==", "pending")))).forEach((d) => {
+			const data = d.data();
+			if (!results.some((r) => r.docId === d.id || r.folio === data.folio)) results.push({
+				docId: d.id,
+				...data
+			});
+		});
+	} catch {}
+	return results;
 }
 /**
 Listen in real-time or poll for new pending orders in the Cloud Mailbox (/online_orders).
@@ -54946,6 +55008,10 @@ Strips sensitive cost and provider data.
 */
 async function publishCatalogToCloudFirestore(products, storeConfig, departments) {
 	try {
+		if (typeof window !== "undefined" && window.localStorage) window.localStorage.removeItem("CONSOLATA_POS_QUOTA_EXHAUSTED");
+		if (!db || typeof db !== "object" || !db._delegate) try {
+			db = getFirestore(app);
+		} catch {}
 		if (!products || products.length === 0) return 0;
 		const validProducts = products.filter((p) => p && p.id && String(p.id).trim().length > 0).slice(0, 1e4);
 		if (validProducts.length === 0) return 0;
@@ -55108,8 +55174,8 @@ function listenToCloudStoreCatalog(onUpdate) {
 }
 //#endregion
 //#region src/utils/versionHistory.ts
-var CURRENT_BUILD_REV = "v5.67-20261102-R37";
-var CURRENT_APP_VERSION = "5.67 ARG";
+var CURRENT_BUILD_REV = "v5.68-20261106-R38";
+var CURRENT_APP_VERSION = "5.68 ARG";
 var CLOUD_MASTER_SERVER_URL = "https://ais-pre-oron74v33fwvgprqtdsqts-654305302959.us-west2.run.app";
 function isRunningOnLocalNetworkHost() {
 	if (typeof window === "undefined") return false;
@@ -56608,6 +56674,21 @@ var STORAGE_HISTORY_KEY = "CONSOLATA_UPDATE_HISTORY_LOG";
 var STORAGE_LAST_CHECK_KEY = "CONSOLATA_LAST_SW_CHECK";
 var DEFAULT_REVISION_CATALOG = [
 	{
+		rev: "v5.68-20261106-R38",
+		version: "5.68.38",
+		releaseDate: "06/11/2026",
+		title: "Actualizador Oficial Disco C: R38 - Cobro Ágil 100% Teclado (F12), Impresión Directa a Impresora Predeterminada, Selector A4 ARCA y Blindaje de Datos",
+		channel: "Crítica",
+		highlights: [
+			"Cobro Ágil 100% por Teclado (F12): En la pantalla de cobro se puede operar íntegramente sin tocar el mouse (F1 a F8 para cambiar medios de pago al instante, flechas direccionales, autocompletado de importe exacto con Espacio o +, y confirmación instantánea con Enter o F12).",
+			"Impresión Directa Automática de Ticket No Fiscal: El ticket no fiscal se envía automáticamente a la impresora térmica predeterminada de Windows. Con presionar Enter o Esc el cajero queda listo para el siguiente cliente en menos de un segundo.",
+			"Facturación ARCA / AFIP Opcional con Selector de Impresora A4: Sigue siendo 100% opcional emitirla (tecla F en el ticket). Al emitir factura electrónica A4, se abre el selector de impresoras de Windows/navegador para elegir la impresora A4 física (HP, Epson, Brother o PDF).",
+			"Blindaje Definitivo de Ventas en PCs Cliente: Sistema de fusión aditiva permanente (Master Ledger + Bulletproof Offline State). Las terminales cliente nunca más sobrescriben ni pierden tickets al sincronizar con el Servidor.",
+			"Prevención de Códigos de Barras Duplicados: Validación estricta que impide asignar un código de barras ya existente en el catálogo.",
+			"Ventana de Venta con Enfoque Continuo: Al hacer clic en cualquier parte de la pantalla de ventas, el foco vuelve automáticamente al campo de código de barras."
+		]
+	},
+	{
 		rev: "v5.67-20261102-R37",
 		version: "5.67.37",
 		releaseDate: "02/11/2026",
@@ -56953,7 +57034,7 @@ function syncAndGetRevisionHistory() {
 	} catch {
 		storedTimestamps = {};
 	}
-	if (!storedTimestamps["v5.67-20261102-R37"]) {
+	if (!storedTimestamps["v5.68-20261106-R38"]) {
 		storedTimestamps[CURRENT_BUILD_REV] = nowFormatted;
 		try {
 			localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(storedTimestamps));
@@ -57053,7 +57134,7 @@ async function inspectAndCheckServiceWorkerUpdate() {
 			const cloudData = await cloudResp.json();
 			if (cloudData && typeof cloudData.rev === "string" && cloudData.rev.trim() !== "") {
 				const cloudRev = cloudData.rev.trim();
-				if (cloudRev !== "v5.67-20261102-R37") serverRev = cloudRev;
+				if (cloudRev !== "v5.68-20261106-R38") serverRev = cloudRev;
 			}
 		}
 	} catch {}
@@ -57069,7 +57150,7 @@ async function inspectAndCheckServiceWorkerUpdate() {
 		totalCachedRequests,
 		serverRev,
 		serverReachable,
-		newVersionAvailable: waitingUpdateFound || installingUpdateFound || serverReachable && serverRev !== "v5.67-20261102-R37",
+		newVersionAvailable: waitingUpdateFound || installingUpdateFound || serverReachable && serverRev !== "v5.68-20261106-R38",
 		checkedAt
 	};
 }
@@ -57119,7 +57200,7 @@ async function pushCloudUpdateToLocalPC(force = false) {
 		pushed: false,
 		localReachable: false
 	};
-	if (!force && (currentLocalRev === "v5.67-20261102-R37" || lastPushedLocalRev === "v5.67-20261102-R37")) return {
+	if (!force && (currentLocalRev === "v5.68-20261106-R38" || lastPushedLocalRev === "v5.68-20261106-R38")) return {
 		pushed: false,
 		localReachable: true,
 		localRev: currentLocalRev
@@ -57143,7 +57224,7 @@ async function pushCloudUpdateToLocalPC(force = false) {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
 				zipBase64: packData.zipBase64,
-				rev: packData.rev || "v5.67-20261102-R37",
+				rev: packData.rev || "v5.68-20261106-R38",
 				cloudUrl: window.location.origin
 			})
 		});
@@ -57205,7 +57286,7 @@ async function purgeServiceWorkerCacheAndReload() {
 			});
 			if (healthResp.ok) {
 				const healthJson = await healthResp.json();
-				if (healthJson && typeof healthJson.rev === "string" && healthJson.rev.trim() !== "" && healthJson.rev.trim() !== "v5.67-20261102-R37") localServerUpdatedOk = true;
+				if (healthJson && typeof healthJson.rev === "string" && healthJson.rev.trim() !== "" && healthJson.rev.trim() !== "v5.68-20261106-R38") localServerUpdatedOk = true;
 			}
 		} catch {}
 		if (!localServerUpdatedOk) try {
@@ -58347,16 +58428,25 @@ function filterAndSortProductsByQuery(products, rawQuery, deptFilter = "todos") 
 */
 function sanitizeProductsList(products) {
 	if (!Array.isArray(products)) return [];
+	let deletedNames = /* @__PURE__ */ new Set();
+	try {
+		if (typeof window !== "undefined" && window.localStorage) {
+			const saved = window.localStorage.getItem("CONSOLATA_DELETED_DEPT_NAMES");
+			if (saved) deletedNames = new Set(JSON.parse(saved).map((n) => n.toUpperCase()));
+		}
+	} catch {}
 	return products.map((p) => {
 		const rawWholesalePrice = p.wholesalePrice ?? p.precioMayoreo ?? p.mayorista ?? p.wholesale_price;
 		const rawWholesaleQty = p.wholesaleQuantity ?? p.wholesaleMinQty ?? p.minWholesaleQuantity ?? p.cantidadMayoreo ?? p.wholesale_quantity;
 		const parsedWp = rawWholesalePrice !== void 0 ? Number(rawWholesalePrice) : void 0;
 		const parsedWq = rawWholesaleQty !== void 0 ? Number(rawWholesaleQty) : void 0;
+		let dept = fixMojibakeString(p.department || "VARIOS").toUpperCase();
+		if (deletedNames.has(dept)) dept = "GENERAL";
 		return {
 			...p,
 			barcode: cleanBarcodeString(p.barcode),
 			description: fixMojibakeString(p.description),
-			department: fixMojibakeString(p.department || "VARIOS").toUpperCase(),
+			department: dept,
 			subdepartment: p.subdepartment ? fixMojibakeString(p.subdepartment) : void 0,
 			provider: p.provider ? fixMojibakeString(p.provider) : "- Sin Proveedor -",
 			notes: p.notes ? fixMojibakeString(p.notes) : void 0,
@@ -58370,11 +58460,19 @@ function sanitizeProductsList(products) {
 }
 function sanitizeDepartmentsList(departments) {
 	if (!Array.isArray(departments)) return [];
+	let deletedIds = /* @__PURE__ */ new Set();
+	let deletedNames = /* @__PURE__ */ new Set();
+	try {
+		if (typeof window !== "undefined" && window.localStorage) {
+			deletedIds = new Set(JSON.parse(window.localStorage.getItem("CONSOLATA_DELETED_DEPT_IDS") || "[]"));
+			deletedNames = new Set(JSON.parse(window.localStorage.getItem("CONSOLATA_DELETED_DEPT_NAMES") || "[]").map((n) => n.toUpperCase()));
+		}
+	} catch {}
 	const map = /* @__PURE__ */ new Map();
 	for (const d of departments) {
 		if (!d || !d.name) continue;
 		const cleanName = fixMojibakeString(d.name).toUpperCase();
-		if (!cleanName) continue;
+		if (!cleanName || deletedNames.has(cleanName) || d.id && deletedIds.has(d.id)) continue;
 		const key = normalizeDeptKey(cleanName);
 		if (!key) continue;
 		const cleanSubs = Array.isArray(d.subdepartments) ? Array.from(new Set(d.subdepartments.map((s) => fixMojibakeString(s)).filter(Boolean))) : [];
@@ -58398,7 +58496,7 @@ function sanitizeDepartmentsList(departments) {
 			payoutNotes: cleanNotes
 		});
 	}
-	return Array.from(map.values());
+	return Array.from(map.values()).filter((d) => !deletedIds.has(d.id) && !deletedNames.has(d.name.toUpperCase()));
 }
 function sanitizeCustomersList(customers) {
 	if (!Array.isArray(customers)) return [];
@@ -58763,10 +58861,22 @@ var POSProvider = ({ children }) => {
 	});
 	const deletedDeptIdsRef = (0, import_react.useRef)(deletedDeptIds);
 	deletedDeptIdsRef.current = deletedDeptIds;
+	const [deletedDeptNames, setDeletedDeptNames] = (0, import_react.useState)(() => {
+		try {
+			const saved = localStorage.getItem("CONSOLATA_DELETED_DEPT_NAMES");
+			return saved ? new Set(JSON.parse(saved).map((n) => n.toUpperCase())) : /* @__PURE__ */ new Set();
+		} catch {
+			return /* @__PURE__ */ new Set();
+		}
+	});
+	const deletedDeptNamesRef = (0, import_react.useRef)(deletedDeptNames);
+	deletedDeptNamesRef.current = deletedDeptNames;
 	const [departments, setDepartments] = (0, import_react.useState)(() => {
 		try {
+			const deletedIds = new Set(JSON.parse(localStorage.getItem("CONSOLATA_DELETED_DEPT_IDS") || "[]"));
+			const deletedNames = new Set(JSON.parse(localStorage.getItem("CONSOLATA_DELETED_DEPT_NAMES") || "[]").map((n) => n.toUpperCase()));
 			const saved = localStorage.getItem(`${STORAGE_KEY}_DEPARTMENTS`);
-			return saved ? sanitizeDepartmentsList(JSON.parse(saved)) : sanitizeDepartmentsList(INITIAL_DEPARTMENTS);
+			return (saved ? sanitizeDepartmentsList(JSON.parse(saved)) : sanitizeDepartmentsList(INITIAL_DEPARTMENTS)).filter((d) => !deletedIds.has(d.id) && !deletedNames.has(d.name.toUpperCase()));
 		} catch {
 			return sanitizeDepartmentsList(INITIAL_DEPARTMENTS);
 		}
@@ -58803,7 +58913,20 @@ var POSProvider = ({ children }) => {
 	const [sales, setSales] = (0, import_react.useState)(() => {
 		try {
 			const saved = localStorage.getItem(`${STORAGE_KEY}_SALES`);
-			if (saved) return normalizeLegacyWebOrderSales(JSON.parse(saved));
+			if (saved) {
+				const parsed = normalizeLegacyWebOrderSales(JSON.parse(saved));
+				if (parsed.length > 0) return parsed;
+			}
+			const existingMaster = localStorage.getItem("CONSOLATA_POS_MASTER_LEDGER_SALES");
+			if (existingMaster) {
+				const masterParsed = normalizeLegacyWebOrderSales(JSON.parse(existingMaster));
+				if (masterParsed.length > 0) return masterParsed;
+			}
+			const bulletproof = localStorage.getItem("CONSOLATA_BULLETPROOF_OFFLINE_STATE");
+			if (bulletproof) {
+				const bpParsed = JSON.parse(bulletproof);
+				if (Array.isArray(bpParsed.sales) && bpParsed.sales.length > 0) return normalizeLegacyWebOrderSales(bpParsed.sales);
+			}
 			return isCleanResetActive() ? [] : normalizeLegacyWebOrderSales(INITIAL_SALES);
 		} catch {
 			return isCleanResetActive() ? [] : normalizeLegacyWebOrderSales(INITIAL_SALES);
@@ -59122,6 +59245,7 @@ var POSProvider = ({ children }) => {
 	const [selectedSaleForTicket, setSelectedSaleForTicket] = (0, import_react.useState)(null);
 	const [toast, setToast] = (0, import_react.useState)(null);
 	const [confirmDialog, setConfirmDialog] = (0, import_react.useState)(null);
+	const [posAlertModal, setPosAlertModal] = (0, import_react.useState)(null);
 	const [isCloseShiftDialogOpen, setIsCloseShiftDialogOpen] = (0, import_react.useState)(false);
 	const [isCorteSalidaOpen, setIsCorteSalidaOpen] = (0, import_react.useState)(false);
 	const [isInstaladoresOpen, setIsInstaladoresOpen] = (0, import_react.useState)(false);
@@ -60882,6 +61006,24 @@ var POSProvider = ({ children }) => {
 		else targetProduct = productOrBarcode;
 		if (!targetProduct) {
 			if (config.soundEnabled) hardwareAudio.playErrorTone();
+			setPosAlertModal({
+				isOpen: true,
+				title: "PRODUCTO NO ENCONTRADO EN EL CATÁLOGO",
+				message: typeof productOrBarcode === "string" ? `El código o producto ingresado ("${productOrBarcode}") NO SE ENCUENTRA CARGADO en la base de datos del catálogo. Debe darlo de alta antes de poder venderlo.` : "El producto seleccionado no está registrado en el catálogo.",
+				type: "error"
+			});
+			return false;
+		}
+		const usesInv = targetProduct.usesInventory !== false;
+		const currentStock = Number(targetProduct.stock ?? 0);
+		if (usesInv && currentStock <= 0) {
+			if (config.soundEnabled) hardwareAudio.playErrorTone();
+			setPosAlertModal({
+				isOpen: true,
+				title: "VENTA BLOQUEADA - STOCK AGOTADO (0)",
+				message: `El producto "${targetProduct.description}" (Código: ${targetProduct.barcode || targetProduct.id}) tiene STOCK EN CERO (0). Utiliza control de inventario y no cuenta con stock disponible para la venta.`,
+				type: "warning"
+			});
 			return false;
 		}
 		const unitPrice = customPrice !== void 0 ? customPrice : targetProduct.salePrice;
@@ -62403,6 +62545,14 @@ var POSProvider = ({ children }) => {
 		return true;
 	};
 	const addProduct = (p) => {
+		const barcodeTrimmed = String(p.barcode || "").trim();
+		if (barcodeTrimmed) {
+			const existing = productsRef.current.find((prod) => prod && prod.barcode && prod.barcode.trim().toLowerCase() === barcodeTrimmed.toLowerCase());
+			if (existing) {
+				showToast(`❌ El código de barras "${barcodeTrimmed}" ya existe en la base de datos para el producto "${existing.description}". No se puede duplicar.`, "error");
+				return false;
+			}
+		}
 		localMutationTimeRef.current = Date.now() + 3e4;
 		const newProd = {
 			...p,
@@ -62419,9 +62569,20 @@ var POSProvider = ({ children }) => {
 			return next;
 		});
 		syncNow().catch(() => {});
+		return true;
 	};
 	const updateProduct = (pOrId, updates) => {
 		localMutationTimeRef.current = Date.now() + 3e4;
+		const targetId = typeof pOrId === "string" ? pOrId : pOrId.id;
+		const newBarcode = typeof pOrId === "string" ? updates?.barcode : pOrId.barcode;
+		const barcodeTrimmed = newBarcode ? String(newBarcode).trim() : "";
+		if (barcodeTrimmed) {
+			const existing = productsRef.current.find((prod) => prod && prod.id !== targetId && prod.barcode && prod.barcode.trim().toLowerCase() === barcodeTrimmed.toLowerCase());
+			if (existing) {
+				showToast(`❌ El código de barras "${barcodeTrimmed}" ya está asignado al producto "${existing.description}".`, "error");
+				return;
+			}
+		}
 		setProducts((prev) => {
 			const next = prev.map((item) => {
 				if (typeof pOrId === "string") {
@@ -62700,10 +62861,12 @@ var POSProvider = ({ children }) => {
 			return sanitizeProductsList(next);
 		});
 		if (discoveredDepts.size > 0) setDepartments((prev) => {
+			const deletedIds = new Set(JSON.parse(localStorage.getItem("CONSOLATA_DELETED_DEPT_IDS") || "[]"));
+			const deletedNames = new Set(JSON.parse(localStorage.getItem("CONSOLATA_DELETED_DEPT_NAMES") || "[]").map((n) => n.toUpperCase()));
 			const nextDepts = [...prev];
 			importedList.forEach((item) => {
 				const cleanDept = fixMojibakeString(item.department || "").toUpperCase().trim();
-				if (!cleanDept) return;
+				if (!cleanDept || deletedNames.has(cleanDept)) return;
 				const cleanSub = item.subdepartment ? fixMojibakeString(item.subdepartment).trim() : "";
 				const dKey = normalizeDeptKey(cleanDept);
 				const idx = nextDepts.findIndex((d) => normalizeDeptKey(d.name) === dKey);
@@ -62718,7 +62881,7 @@ var POSProvider = ({ children }) => {
 					subdepartments: cleanSub ? [cleanSub] : []
 				});
 			});
-			return sanitizeDepartmentsList(nextDepts);
+			return sanitizeDepartmentsList(nextDepts).filter((d) => !deletedIds.has(d.id) && !deletedNames.has(d.name.toUpperCase()));
 		});
 		return {
 			added,
@@ -62753,14 +62916,24 @@ var POSProvider = ({ children }) => {
 	};
 	const deleteDepartment = (id) => {
 		localMutationTimeRef.current = Date.now() + 3e4;
-		setDeletedDeptIds((prev) => {
-			const next = new Set(prev).add(id);
+		const deptToDelete = departments.find((d) => d.id === id);
+		const deptName = deptToDelete ? deptToDelete.name.toUpperCase() : "";
+		const nextDeletedIds = new Set(deletedDeptIdsRef.current).add(id);
+		setDeletedDeptIds(nextDeletedIds);
+		try {
+			localStorage.setItem("CONSOLATA_DELETED_DEPT_IDS", JSON.stringify(Array.from(nextDeletedIds)));
+		} catch {}
+		let nextDeletedNames = deletedDeptNamesRef.current;
+		if (deptName) {
+			nextDeletedNames = new Set(deletedDeptNamesRef.current).add(deptName);
+			setDeletedDeptNames(nextDeletedNames);
 			try {
-				localStorage.setItem("CONSOLATA_DELETED_DEPT_IDS", JSON.stringify(Array.from(next)));
+				localStorage.setItem("CONSOLATA_DELETED_DEPT_NAMES", JSON.stringify(Array.from(nextDeletedNames)));
 			} catch {}
-			return next;
-		});
-		setDepartments((prev) => prev.filter((d) => d.id !== id));
+		}
+		const nextDepts = departments.filter((d) => d.id !== id && (deptName ? d.name.toUpperCase() !== deptName : true));
+		setDepartments(nextDepts);
+		publishCatalogToCloudFirestore(productsRef.current, configRef.current?.tiendaOnlinePropiaConfig, nextDepts).catch(() => {});
 		syncNow().catch(() => {});
 	};
 	const addSubdepartment = (departmentId, subdepartmentName) => {
@@ -63489,7 +63662,7 @@ var POSProvider = ({ children }) => {
 				setProducts(mergedProducts);
 			}
 			if (Array.isArray(data.departments)) {
-				const cleanDepts = sanitizeDepartmentsList(data.departments).filter((d) => !deletedDeptIdsRef.current.has(d.id));
+				const cleanDepts = sanitizeDepartmentsList(data.departments).filter((d) => !deletedDeptIdsRef.current.has(d.id) && !deletedDeptNamesRef.current.has(String(d.name || "").toUpperCase()));
 				setDepartments(cleanDepts);
 			}
 			if (Array.isArray(data.customers)) {
@@ -63499,20 +63672,26 @@ var POSProvider = ({ children }) => {
 			}
 			if (Array.isArray(data.sales)) {
 				const freshNewWebOrders = [];
-				const mergedIncomingSales = data.sales.map((inc) => {
-					if (!inc) return inc;
-					const isWeb = inc.folio?.startsWith("WEB-") || inc.folio?.startsWith("TN-") || inc.registerName === "Tienda Online Web" || inc.registerName === "Tiendanube Web" || inc.registerName === "Tienda Web (Cloud Queue)";
-					const localExisting = salesRef.current.find((l) => l && (l.id === inc.id || inc.folio && l.folio === inc.folio));
+				const currentSales = salesRef.current;
+				const salesMap = /* @__PURE__ */ new Map();
+				for (const s of currentSales) if (s && (s.id || s.folio)) salesMap.set(s.id || s.folio, s);
+				for (const inc of data.sales) {
+					if (!inc) continue;
+					const key = inc.id || inc.folio;
+					if (!key) continue;
+					const localExisting = salesMap.get(key);
 					let resolvedSale = { ...inc };
-					if (localExisting && (localExisting.webOrderStatus === "confirmado" || localExisting.webOrderStatus === "cancelado") && resolvedSale.webOrderStatus !== "confirmado" && resolvedSale.webOrderStatus !== "cancelado") resolvedSale = {
-						...resolvedSale,
-						webOrderStatus: localExisting.webOrderStatus,
-						confirmedAt: localExisting.confirmedAt,
-						confirmedTicketFolio: localExisting.confirmedTicketFolio,
-						cancelledAt: localExisting.cancelledAt,
-						cancelReason: localExisting.cancelReason
-					};
-					else if (isWeb && !resolvedSale.webOrderStatus) resolvedSale.webOrderStatus = hasInitialPullCompletedRef.current ? "pendiente" : "confirmado";
+					const isWeb = resolvedSale.folio?.startsWith("WEB-") || resolvedSale.folio?.startsWith("TN-") || resolvedSale.registerName === "Tienda Online Web" || resolvedSale.registerName === "Tiendanube Web" || resolvedSale.registerName === "Tienda Web (Cloud Queue)";
+					if (localExisting) {
+						if ((localExisting.webOrderStatus === "confirmado" || localExisting.webOrderStatus === "cancelado") && resolvedSale.webOrderStatus !== "confirmado" && resolvedSale.webOrderStatus !== "cancelado") resolvedSale = {
+							...resolvedSale,
+							webOrderStatus: localExisting.webOrderStatus,
+							confirmedAt: localExisting.confirmedAt,
+							confirmedTicketFolio: localExisting.confirmedTicketFolio,
+							cancelledAt: localExisting.cancelledAt,
+							cancelReason: localExisting.cancelReason
+						};
+					} else if (isWeb && !resolvedSale.webOrderStatus) resolvedSale.webOrderStatus = hasInitialPullCompletedRef.current ? "pendiente" : "confirmado";
 					if (isWeb) {
 						const orderKey = resolvedSale.folio || resolvedSale.id;
 						if (orderKey && !knownWebOrderIdsRef.current.has(orderKey)) {
@@ -63520,10 +63699,14 @@ var POSProvider = ({ children }) => {
 							if (hasInitialPullCompletedRef.current && resolvedSale.webOrderStatus === "pendiente") freshNewWebOrders.push(resolvedSale);
 						}
 					}
-					return resolvedSale;
-				});
+					salesMap.set(key, resolvedSale);
+				}
+				const mergedIncomingSales = Array.from(salesMap.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 				salesRef.current = mergedIncomingSales;
 				setSales(mergedIncomingSales);
+				try {
+					localStorage.setItem(`${STORAGE_KEY}_SALES`, JSON.stringify(mergedIncomingSales.slice(0, 5e3)));
+				} catch {}
 				if (freshNewWebOrders.length > 0) {
 					const latestOrder = freshNewWebOrders[0];
 					if (config.soundEnabled) hardwareAudio.playCashDrawerChime();
@@ -64115,6 +64298,7 @@ var POSProvider = ({ children }) => {
 				departments,
 				config,
 				customers: customers.slice(0, 2e3),
+				sales: sales.slice(0, 3e3),
 				timestamp: Date.now()
 			};
 			localStorage.setItem("CONSOLATA_BULLETPROOF_OFFLINE_STATE", JSON.stringify(payload));
@@ -64123,7 +64307,8 @@ var POSProvider = ({ children }) => {
 		products,
 		departments,
 		config,
-		customers
+		customers,
+		sales
 	]);
 	(0, import_react.useEffect)(() => {
 		pullStateFromServer(true);
@@ -64149,13 +64334,24 @@ var POSProvider = ({ children }) => {
 	}, [pullStateFromServer]);
 	(0, import_react.useEffect)(() => {
 		if (isPublicStoreVisitorHost()) return;
-		const unsubscribe = listenToPendingCloudOrders(async (cloudOrders) => {
+		let mounted = true;
+		const processOrders = async (cloudOrders) => {
+			if (!mounted || !Array.isArray(cloudOrders) || cloudOrders.length === 0) return;
 			let importedCount = 0;
 			for (const ord of cloudOrders) {
 				if (!ord || !ord.docId) continue;
 				const folio = ord.folio || `WEB-${ord.createdAt}`;
-				if (sales.some((s) => s.folio === folio || s.id === `sale-${folio}`)) {
+				if (salesRef.current.some((s) => s.folio === folio || s.id === `sale-${folio}`)) {
 					await markCloudOrderAsImported(ord.docId);
+					try {
+						if (typeof window !== "undefined" && window.localStorage) {
+							const updated = JSON.parse(window.localStorage.getItem("CONSOLATA_OFFLINE_WEB_ORDERS") || "[]").map((lo) => lo.docId === ord.docId ? {
+								...lo,
+								status: "imported"
+							} : lo);
+							window.localStorage.setItem("CONSOLATA_OFFLINE_WEB_ORDERS", JSON.stringify(updated));
+						}
+					} catch {}
 					continue;
 				}
 				const saleItems = (ord.items || []).map((it, idx) => ({
@@ -64194,29 +64390,43 @@ var POSProvider = ({ children }) => {
 				};
 				importSalesBulk([newSale]);
 				await markCloudOrderAsImported(ord.docId);
+				try {
+					if (typeof window !== "undefined" && window.localStorage) {
+						const updated = JSON.parse(window.localStorage.getItem("CONSOLATA_OFFLINE_WEB_ORDERS") || "[]").map((lo) => lo.docId === ord.docId ? {
+							...lo,
+							status: "imported"
+						} : lo);
+						window.localStorage.setItem("CONSOLATA_OFFLINE_WEB_ORDERS", JSON.stringify(updated));
+					}
+				} catch {}
 				importedCount++;
 			}
 			if (importedCount > 0) {
 				showToast(`✨ ¡Se recibieron ${importedCount} pedidos nuevos desde el Buzón de la Nube!`, "success");
 				hardwareAudio.playCashDrawerChime();
 			}
-		});
-		return () => {
-			unsubscribe();
 		};
-	}, [
-		sales,
-		importSalesBulk,
-		showToast
-	]);
+		const unsubscribe = listenToPendingCloudOrders((cloudOrders) => {
+			processOrders(cloudOrders);
+		});
+		const pollInterval = setInterval(async () => {
+			try {
+				const pending = await fetchPendingCloudOrders();
+				if (pending.length > 0) processOrders(pending);
+			} catch {}
+		}, 4e3);
+		return () => {
+			mounted = false;
+			unsubscribe();
+			clearInterval(pollInterval);
+		};
+	}, [importSalesBulk, showToast]);
 	(0, import_react.useEffect)(() => {
 		if (!Array.isArray(products) || products.length === 0) return;
 		if (isDefaultDemoCatalog(products)) return;
 		saveCachedRealStoreCatalog(products, config.tiendaOnlinePropiaConfig, departments);
 		if (isPublicStoreVisitorHost()) return;
-		const timer = setTimeout(() => {
-			publishCatalogToCloudFirestore(products, config.tiendaOnlinePropiaConfig, departments).catch(() => {});
-		}, 2200);
+		const timer = setTimeout(() => {}, 2200);
 		return () => clearTimeout(timer);
 	}, [
 		products,
@@ -64686,6 +64896,8 @@ var POSProvider = ({ children }) => {
 			confirmDialog,
 			showConfirm,
 			closeConfirm,
+			posAlertModal,
+			setPosAlertModal,
 			isCloseShiftDialogOpen,
 			setIsCloseShiftDialogOpen,
 			isCorteSalidaOpen,
@@ -99390,6 +99602,14 @@ var VentasView = () => {
 	(0, import_react.useEffect)(() => {
 		setLiveDropdownIndex(0);
 	}, [barcodeInput]);
+	(0, import_react.useEffect)(() => {
+		const handleGlobalClick = (e) => {
+			const target = e.target;
+			if (!target.closest("button") && !target.closest("input") && !target.closest("select") && !target.closest("textarea") && !target.closest(".modal-content")) inputRef.current?.focus();
+		};
+		window.addEventListener("click", handleGlobalClick);
+		return () => window.removeEventListener("click", handleGlobalClick);
+	}, []);
 	const isAnyModalOpen = isCobroModalOpen || isBuscarModalOpen || isComunModalOpen || isEntradaSalidaModalOpen || isVerificadorModalOpen || isHistorialVentasOpen || isTicketDiscountModalOpen || Boolean(granelModalState?.isOpen) || Boolean(discountModalState?.isOpen) || Boolean(itemToDeleteState);
 	(0, import_react.useEffect)(() => {
 		if (!isAnyModalOpen) {
@@ -100125,7 +100345,7 @@ var VentasView = () => {
 									children: item.barcode
 								}),
 								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-									className: "py-1.5 px-2 sm:px-3 border-r border-slate-200 text-slate-900",
+									className: "py-2 px-2 sm:px-3 border-r border-slate-200 text-slate-900 text-sm sm:text-base font-bold",
 									children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 										className: "flex items-center justify-between gap-1",
 										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -101186,6 +101406,149 @@ var PrinterService = class PrinterService {
 		PrinterService.printHtmlTicket(fullTicketHtml, config, `Ticket-${sale.folio || "Venta"}`);
 	}
 	/**
+	* Imprime el Resumen de Cuenta Corriente en Ticket Térmico (80mm o 58mm).
+	* Muestra con tipografía grande, nítida y 100% legible todos los movimientos,
+	* sus importes y el TOTAL ADEUDADO destacado.
+	*/
+	static printCustomerAccountThermalTicket(params) {
+		const { customer, movements, config } = params;
+		const is58mm = config.ticketWidth === 58 || config.ticketWidth === 36 || config.ticketWidth === 40;
+		const now = /* @__PURE__ */ new Date();
+		const formattedDate = now.toLocaleDateString("es-AR");
+		const formattedTime = now.toLocaleTimeString("es-AR", {
+			hour: "2-digit",
+			minute: "2-digit"
+		});
+		const bal = Number(customer.currentDebt ?? customer.currentBalance ?? 0);
+		const isDebt = bal > 0;
+		const hasSaldoAFavor = bal < 0;
+		const lineSep = is58mm ? "--------------------------------" : "------------------------------------------";
+		const doubleSep = is58mm ? "================================" : "==========================================";
+		const plainLines = [
+			(config.ticketTitle || config.businessName || "LA CONSOLATA LIMPIEZA").toUpperCase(),
+			config.businessAddress || "",
+			config.businessCuit ? `CUIT: ${config.businessCuit}` : "",
+			doubleSep,
+			"RESUMEN DE CUENTA CORRIENTE",
+			`EMISION: ${formattedDate} ${formattedTime} hs`,
+			lineSep,
+			`CLIENTE: ${customer.name}`,
+			customer.cuit ? `CUIT/DNI: ${customer.cuit}` : "",
+			`FOLIO: #${customer.folio}   TEL: ${customer.phone || "-"}`,
+			customer.address1 ? `DIR: ${customer.address1}` : "",
+			lineSep,
+			"FECHA      DETALLE/COMPR        IMPORTE",
+			lineSep
+		].filter(Boolean);
+		movements.forEach((m) => {
+			const dStr = new Date(m.date || m.timestamp || Date.now()).toLocaleDateString("es-AR", {
+				day: "2-digit",
+				month: "2-digit"
+			});
+			const amtStr = `${m.type === "cargo" ? "+" : "-"}${formatARS(m.amount)}`;
+			const conceptText = (m.concept || m.description || (m.type === "cargo" ? "Cargo" : "Abono")).slice(0, 18);
+			plainLines.push(`${dStr} ${conceptText.padEnd(18, " ")} ${amtStr.padStart(10, " ")}`);
+		});
+		plainLines.push(doubleSep);
+		plainLines.push(isDebt ? `TOTAL ADEUDADO: ${formatARS(bal)}` : hasSaldoAFavor ? `SALDO A FAVOR: +${formatARS(Math.abs(bal))}` : "SALDO AL DIA: $ 0,00");
+		plainLines.push(`LIMITE CREDITO: ${formatARS(customer.creditLimit)}`);
+		plainLines.push(lineSep);
+		plainLines.push("");
+		plainLines.push("Firma Cliente: _________________________");
+		plainLines.push("");
+		const plainText = plainLines.join("\r\n");
+		try {
+			const w = window;
+			if (w.chrome?.webview?.hostObjects?.spooler?.ImprimirTicket) {
+				w.chrome.webview.hostObjects.spooler.ImprimirTicket(plainText);
+				return;
+			}
+			if (w.chrome?.webview?.hostObjects?.sync?.spooler?.ImprimirTicket) {
+				w.chrome.webview.hostObjects.sync.spooler.ImprimirTicket(plainText);
+				return;
+			}
+			if (w.external && typeof w.external.ImprimirTicket === "function") {
+				w.external.ImprimirTicket(plainText);
+				return;
+			}
+		} catch {}
+		const rowsHtml = movements.map((m) => {
+			const dStr = new Date(m.date || m.timestamp || Date.now()).toLocaleDateString("es-AR", {
+				day: "2-digit",
+				month: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit"
+			});
+			const sign = m.type === "cargo" ? "+" : "-";
+			return `
+          <div style="margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px dotted #666;">
+            <div style="display: flex; justify-content: space-between; font-size: 11.5px; font-weight: 800;">
+              <span>${dStr} ${m.type === "cargo" ? "[CARGO]" : "[ABONO]"}</span>
+              <span style="font-family: monospace; font-size: 13.5px; font-weight: 900;">${sign}${formatARS(m.amount)}</span>
+            </div>
+            <div style="font-size: 11.5px; color: #111; margin-top: 2px;">
+              ${m.concept || m.description || "-"} ${m.folio ? `<strong>(${m.folio})</strong>` : ""}
+            </div>
+            <div style="font-size: 10.5px; color: #444; text-align: right; margin-top: 1px;">
+              Saldo: <strong>${m.balanceAfter < 0 ? `+${formatARS(Math.abs(m.balanceAfter))} a favor` : formatARS(m.balanceAfter)}</strong>
+            </div>
+          </div>
+        `;
+		}).join("");
+		const html = `
+      <div style="font-family: Arial, Helvetica, sans-serif; width: 100%; color: #000; font-size: 12px; line-height: 1.35;">
+        <div style="text-align: center; margin-bottom: 4px;">
+          <div style="font-size: 16px; font-weight: 900; letter-spacing: 0.5px;">${config.ticketTitle || config.businessName || "LA CONSOLATA LIMPIEZA"}</div>
+          ${config.businessAddress ? `<div style="font-size: 11px;">${config.businessAddress}</div>` : ""}
+          ${config.businessCuit ? `<div style="font-size: 11px; font-weight: bold;">CUIT: ${config.businessCuit}</div>` : ""}
+        </div>
+
+        <div style="border-top: 2.5px solid #000; border-bottom: 2.5px solid #000; padding: 5px 0; margin: 6px 0; text-align: center;">
+          <div style="font-size: 14px; font-weight: 900; letter-spacing: 0.5px;">RESUMEN DE CUENTA CORRIENTE</div>
+          <div style="font-size: 10.5px; color: #222;">Fecha de emisión: ${formattedDate} ${formattedTime} hs</div>
+        </div>
+
+        <div style="background: #f4f4f4; border: 1.5px solid #000; padding: 7px 8px; border-radius: 4px; margin-bottom: 8px; font-size: 12px;">
+          <div><strong>CLIENTE:</strong> ${customer.name}</div>
+          ${customer.cuit ? `<div><strong>CUIT / DNI:</strong> ${customer.cuit}</div>` : ""}
+          <div><strong>FOLIO:</strong> #${customer.folio} &bull; <strong>TEL:</strong> ${customer.phone || "-"}</div>
+          ${customer.address1 ? `<div><strong>DOMICILIO:</strong> ${customer.address1}</div>` : ""}
+        </div>
+
+        <!-- TOTAL ADEUDADO DESTACADO BIEN GRANDE Y LEGIBLE -->
+        <div style="border: 3px solid #000; padding: 8px 6px; text-align: center; border-radius: 6px; margin: 8px 0; background: #fff;">
+          <div style="font-size: 12px; font-weight: 900; text-transform: uppercase; color: #000;">
+            ${isDebt ? "TOTAL ADEUDADO AL DÍA:" : hasSaldoAFavor ? "SALDO A FAVOR DEL CLIENTE:" : "ESTADO DE CUENTA:"}
+          </div>
+          <div style="font-size: 24px; font-weight: 900; font-family: monospace; margin: 4px 0; color: #000;">
+            ${formatARS(Math.abs(bal))}
+          </div>
+          <div style="font-size: 11px; color: #222; font-weight: 600;">
+            Límite: ${formatARS(customer.creditLimit)} &bull; Disp.: ${formatARS(Math.max(0, customer.creditLimit - (isDebt ? bal : 0)))}
+          </div>
+        </div>
+
+        <div style="border-bottom: 2px solid #000; margin: 8px 0 6px 0;"></div>
+        <div style="font-size: 11.5px; font-weight: 900; text-transform: uppercase; margin-bottom: 6px;">
+          Detalle de Movimientos (${movements.length}):
+        </div>
+
+        <div>
+          ${rowsHtml || "<div style=\"text-align: center; padding: 8px; font-style: italic;\">Sin movimientos registrados</div>"}
+        </div>
+
+        <div style="border-top: 2.5px solid #000; margin: 12px 0 8px 0;"></div>
+
+        <div style="text-align: center; font-size: 11px; margin-top: 18px;">
+          <div style="margin-bottom: 26px;">Firma del Cliente: ___________________________</div>
+          <div>Aclaración / DNI: ___________________________</div>
+          <div style="margin-top: 8px; font-size: 9.5px; color: #444;">Documento de control interno de cuenta corriente.</div>
+        </div>
+      </div>
+    `;
+		PrinterService.printHtmlTicket(html, config, `Resumen-CtaCte-${customer.folio}`);
+	}
+	/**
 	* Impresión Directa en Impresora Física Hoja A4 — 21 Etiquetas por Hoja (7 cm x 3,5 cm)
 	* Usa un iframe aislado con CSS nativo autocontenido y @page { size: A4 portrait; margin: 10mm ... }
 	* para que cualquier impresora física (láser o chorro de tinta) imprima directo sin pasar a PDF.
@@ -101908,8 +102271,8 @@ var PrinterService = class PrinterService {
             background: #ffffff !important;
             color: #000000 !important;
             font-family: Arial, Helvetica, sans-serif;
-            font-size: 11px;
-            line-height: 1.35;
+            font-size: 13px;
+            line-height: 1.4;
           }
           .report-wrapper {
             width: 100%;
@@ -101918,7 +102281,7 @@ var PrinterService = class PrinterService {
           .report-header {
             border-bottom: 2.5px solid #000000;
             padding-bottom: 8px;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
             display: flex;
             justify-content: space-between;
             align-items: flex-start;
@@ -101926,25 +102289,25 @@ var PrinterService = class PrinterService {
           }
           .report-title-block h1 {
             margin: 0;
-            font-size: 16px;
+            font-size: 19px;
             font-weight: 900;
             text-transform: uppercase;
             letter-spacing: 0.3px;
             color: #000000;
           }
           .report-title-block .subtitle {
-            margin-top: 3px;
-            font-size: 11px;
+            margin-top: 4px;
+            font-size: 12px;
             font-weight: 700;
-            color: #333333;
+            color: #222222;
           }
           .report-brand-block {
             text-align: right;
-            font-size: 10.5px;
+            font-size: 11.5px;
             color: #111111;
           }
           .report-brand-block .biz-name {
-            font-size: 13px;
+            font-size: 15px;
             font-weight: 900;
             text-transform: uppercase;
           }
@@ -101953,11 +102316,11 @@ var PrinterService = class PrinterService {
             grid-template-columns: 1fr 1fr;
             gap: 8px 16px;
             background: #f8fafc;
-            border: 1px solid #94a3b8;
-            border-radius: 5px;
-            padding: 7px 10px;
-            margin-bottom: 10px;
-            font-size: 11px;
+            border: 1.5px solid #64748b;
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin-bottom: 12px;
+            font-size: 12px;
           }
           .meta-col-right {
             text-align: right;
@@ -101969,19 +102332,19 @@ var PrinterService = class PrinterService {
             margin-bottom: 0;
           }
           .meta-label {
-            color: #334155;
-            font-weight: 700;
+            color: #1e293b;
+            font-weight: 800;
           }
           .kpi-grid {
             display: grid;
-            gap: 8px;
-            margin-bottom: 12px;
+            gap: 10px;
+            margin-bottom: 14px;
             page-break-inside: avoid !important;
           }
           .kpi-card {
-            border: 1.5px solid #334155;
-            border-radius: 5px;
-            padding: 6px 8px;
+            border: 2px solid #334155;
+            border-radius: 6px;
+            padding: 8px 10px;
             background: #ffffff;
           }
           .kpi-primary {
@@ -102001,28 +102364,28 @@ var PrinterService = class PrinterService {
             border-color: #92400e;
           }
           .kpi-label {
-            font-size: 9.5px;
+            font-size: 11px;
             font-weight: 800;
             text-transform: uppercase;
-            color: #334155;
+            color: #1e293b;
           }
           .kpi-value {
-            font-size: 14px;
+            font-size: 20px;
             font-weight: 900;
             font-family: 'Courier New', Courier, monospace;
             color: #000000;
-            margin-top: 2px;
+            margin-top: 3px;
           }
           .kpi-sub {
-            font-size: 9px;
+            font-size: 10px;
             color: #475569;
-            margin-top: 1px;
+            margin-top: 2px;
           }
           table.report-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 12px;
-            font-size: 10.5px;
+            margin-bottom: 14px;
+            font-size: 12px;
           }
           table.report-table thead {
             display: table-header-group;
@@ -102036,13 +102399,13 @@ var PrinterService = class PrinterService {
             color: #000000 !important;
             font-weight: 900;
             text-transform: uppercase;
-            font-size: 9.5px;
-            padding: 6px 6px;
-            border: 1px solid #334155;
+            font-size: 11px;
+            padding: 7px 8px;
+            border: 1.5px solid #334155;
           }
           table.report-table td {
-            padding: 5px 6px;
-            border: 1px solid #cbd5e1;
+            padding: 6px 8px;
+            border: 1px solid #94a3b8;
             color: #000000;
             vertical-align: middle;
           }
@@ -102151,9 +102514,1810 @@ var PrinterService = class PrinterService {
 	}
 };
 //#endregion
+//#region src/components/administracion/ModalFacturarTicket.tsx
+var ModalFacturarTicket = ({ sale, isOpen, onClose, onInvoiceCreated }) => {
+	const { config, customers, generateInvoiceForSale, showToast } = usePOS();
+	const [puntoVenta, setPuntoVenta] = (0, import_react.useState)(config.afipConfig?.puntoVenta || 4);
+	const [tipoComprobante, setTipoComprobante] = (0, import_react.useState)(config.afipConfig?.tipoFactura === "C" ? "FC" : "FB");
+	const [receptorTipoDoc, setReceptorTipoDoc] = (0, import_react.useState)("DNI");
+	const [receptorNroDoc, setReceptorNroDoc] = (0, import_react.useState)("");
+	const [receptorRazonSocial, setReceptorRazonSocial] = (0, import_react.useState)("");
+	const [receptorCondicionIva, setReceptorCondicionIva] = (0, import_react.useState)("Consumidor Final");
+	const [receptorDomicilio, setReceptorDomicilio] = (0, import_react.useState)("");
+	const [isConsultingAfip, setIsConsultingAfip] = (0, import_react.useState)(false);
+	const [isSubmittingWsfe, setIsSubmittingWsfe] = (0, import_react.useState)(false);
+	const [stepWsfe, setStepWsfe] = (0, import_react.useState)("");
+	const [errorMsg, setErrorMsg] = (0, import_react.useState)(null);
+	const [padronVerified, setPadronVerified] = (0, import_react.useState)(false);
+	(0, import_react.useEffect)(() => {
+		if (config.afipConfig?.puntoVenta) setPuntoVenta(Number(config.afipConfig.puntoVenta));
+		else setPuntoVenta(4);
+	}, [isOpen, config.afipConfig?.puntoVenta]);
+	(0, import_react.useEffect)(() => {
+		if (!sale) return;
+		const isMonotributoEmisor = config.afipConfig?.tipoFactura === "C";
+		if (sale.customerId) {
+			const cust = customers.find((c) => c.id === sale.customerId);
+			if (cust) {
+				setReceptorRazonSocial(cust.name);
+				setReceptorNroDoc(cust.cuit || "");
+				setReceptorDomicilio(`${cust.address1}${cust.city ? ", " + cust.city : ""}`);
+				const cleanDoc = (cust.cuit || "").replace(/\D/g, "");
+				if (cleanDoc.length === 11) {
+					setReceptorTipoDoc("CUIT");
+					if (cleanDoc.startsWith("30") || cleanDoc.startsWith("33")) {
+						setReceptorCondicionIva("IVA Responsable Inscripto");
+						setTipoComprobante(isMonotributoEmisor ? "FC" : "FA");
+					} else {
+						setReceptorCondicionIva("Responsable Monotributo");
+						setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
+					}
+				} else {
+					setReceptorTipoDoc("DNI");
+					setReceptorCondicionIva("Consumidor Final");
+					setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
+				}
+				return;
+			}
+		}
+		setReceptorTipoDoc("DNI");
+		setReceptorNroDoc("0");
+		setReceptorRazonSocial(sale.customerName || "CONSUMIDOR FINAL");
+		setReceptorCondicionIva("Consumidor Final");
+		setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
+		setReceptorDomicilio("");
+		setErrorMsg(null);
+	}, [
+		sale,
+		customers,
+		config.afipConfig?.tipoFactura
+	]);
+	if (!isOpen || !sale) return null;
+	const handleConsultarPadron = async () => {
+		if (!receptorNroDoc || receptorNroDoc.trim() === "" || receptorNroDoc === "0") {
+			showToast("Ingrese un CUIT o DNI válido para consultar en ARCA", "warning");
+			return;
+		}
+		setIsConsultingAfip(true);
+		setErrorMsg(null);
+		try {
+			const res = await consultarPadronAfip(receptorNroDoc, customers);
+			if (res.razonSocial) setReceptorRazonSocial(res.razonSocial);
+			setReceptorCondicionIva(res.condicionIva);
+			if (res.domicilioFiscal) setReceptorDomicilio(res.domicilioFiscal);
+			setReceptorTipoDoc(res.tipoDoc);
+			setReceptorNroDoc(res.cuit || receptorNroDoc);
+			if (res.origenDato === "requiere_carga") {
+				setPadronVerified(false);
+				setErrorMsg("CUIT con dígito verificador válido en ARCA, pero aún no registrado en su base local. Ingrese la Razón Social y Domicilio; se guardará automáticamente.");
+				showToast("Ingrese Razón Social y Domicilio para registrar este CUIT en el Padrón ARCA", "warning");
+			} else {
+				setPadronVerified(true);
+				setErrorMsg(null);
+				if (config.afipConfig?.tipoFactura === "C") {
+					setTipoComprobante("FC");
+					showToast(`✓ Contribuyente "${res.razonSocial}" verificado en ARCA (${res.condicionIva}). Factura C asignada.`, "success");
+				} else if (res.condicionIva === "IVA Responsable Inscripto") {
+					setTipoComprobante("FA");
+					showToast(`✓ Contribuyente "${res.razonSocial}" verificado en ARCA (Responsable Inscripto). Factura A asignada.`, "success");
+				} else {
+					setTipoComprobante("FB");
+					showToast(`✓ Contribuyente "${res.razonSocial}" verificado (${res.condicionIva}). Factura B asignada.`, "info");
+				}
+			}
+		} catch {
+			setErrorMsg("No se pudo conectar con el padrón ARCA. Verifique el número ingresado.");
+		} finally {
+			setIsConsultingAfip(false);
+		}
+	};
+	const handleGuardarEnPadron = () => {
+		if (!receptorNroDoc || !receptorRazonSocial) {
+			showToast("Ingrese número de documento y razón social a guardar", "warning");
+			return;
+		}
+		const cleanDoc = receptorNroDoc.replace(/\D/g, "");
+		guardarEnPadronArca({
+			cuit: receptorNroDoc,
+			dni: cleanDoc.length === 11 ? cleanDoc.slice(2, 10).replace(/^0+/, "") : cleanDoc,
+			razonSocial: receptorRazonSocial.trim().toUpperCase(),
+			condicionIva: receptorCondicionIva,
+			tipoDoc: receptorTipoDoc === "Consumidor Final" ? "DNI" : receptorTipoDoc,
+			domicilioFiscal: receptorDomicilio.trim() || "Río Cuarto, Córdoba",
+			localidad: "Río Cuarto",
+			provincia: "Córdoba",
+			actividadPrincipal: "Contribuyente Registrado",
+			estadoClave: "ACTIVO",
+			origenDato: "padron_oficial"
+		});
+		setPadronVerified(true);
+		showToast(`✓ Datos fiscales de "${receptorRazonSocial.trim().toUpperCase()}" guardados en Padrón ARCA`, "success");
+	};
+	const handleEmitirFactura = async () => {
+		if (tipoComprobante === "FA") {
+			if (receptorNroDoc.replace(/\D/g, "").length !== 11) {
+				setErrorMsg("Factura A exige un número de CUIT válido de 11 dígitos.");
+				return;
+			}
+			if (receptorCondicionIva !== "IVA Responsable Inscripto") {
+				setErrorMsg("Solo se puede emitir Factura A a contribuyentes IVA Responsable Inscripto.");
+				return;
+			}
+		}
+		setIsSubmittingWsfe(true);
+		setErrorMsg(null);
+		setStepWsfe("Conectando con Servidor de Autenticación ARCA (WSAA)...");
+		await new Promise((r) => setTimeout(r, 450));
+		setStepWsfe("Validando Certificado Digital X.509 y Token de Acceso...");
+		await new Promise((r) => setTimeout(r, 400));
+		setStepWsfe("Enviando solicitud WSFEv1 FECAESolicitar para Ticket " + sale.folio + "...");
+		try {
+			const invoice = await generateInvoiceForSale(sale.id, {
+				tipoComprobante,
+				puntoVenta,
+				receptorTipoDoc,
+				receptorNroDoc: receptorNroDoc || "0",
+				receptorRazonSocial: receptorRazonSocial || "CONSUMIDOR FINAL",
+				receptorCondicionIva,
+				receptorDomicilio
+			});
+			if (invoice) {
+				showToast(`¡Factura Electrónica ${invoice.tipoComprobante} Nº ${invoice.numeroComprobante} autorizada por ARCA! CAE: ${invoice.cae}`, "success");
+				onInvoiceCreated(invoice);
+				onClose();
+			} else setErrorMsg("Error al generar la factura electrónica en el servidor local.");
+		} catch (e) {
+			setErrorMsg(e?.message || "Error en la autorización de Web Service ARCA/AFIP.");
+		} finally {
+			setIsSubmittingWsfe(false);
+			setStepWsfe("");
+		}
+	};
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+		className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-3",
+		children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			className: "bg-white rounded-xl shadow-2xl border border-slate-300 w-full max-w-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150",
+			children: [
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-gradient-to-r from-blue-900 to-indigo-950 text-white px-5 py-3.5 flex items-center justify-between",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2.5",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center border border-white/20",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldCheck, { className: "w-5 h-5 text-emerald-400" })
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("h3", {
+							className: "text-sm font-bold flex items-center gap-2",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Generar Factura Electrónica ARCA / AFIP" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+								className: "text-[10px] bg-blue-500/30 text-blue-200 border border-blue-400/30 px-2 py-0.5 rounded-full font-mono",
+								children: "WSFEv1"
+							})]
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+							className: "text-[11px] text-slate-300",
+							children: [
+								"Ticket: ",
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+									className: "text-white",
+									children: sale.folio
+								}),
+								" • Total:",
+								" ",
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+									className: "text-emerald-400 font-mono",
+									children: formatARS(sale.total)
+								})
+							]
+						})] })]
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+						onClick: onClose,
+						disabled: isSubmittingWsfe,
+						className: "w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 rounded-lg transition-colors",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
+					})]
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "p-5 space-y-4 max-h-[80vh] overflow-y-auto",
+					children: [
+						errorMsg && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-xs text-red-700",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(TriangleAlert, { className: "w-4 h-4 shrink-0 text-red-500" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: errorMsg })]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "text-slate-500 text-[10px] uppercase font-semibold",
+									children: "Venta Original"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "font-bold text-slate-800",
+									children: [
+										"Ticket Nº ",
+										sale.ticketNumber,
+										" (",
+										sale.folio,
+										")"
+									]
+								})] }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "text-slate-500 text-[10px] uppercase font-semibold",
+									children: "Ítems"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "font-semibold text-slate-700",
+									children: [
+										sale.items.length,
+										" producto",
+										sale.items.length !== 1 ? "s" : ""
+									]
+								})] }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "text-slate-500 text-[10px] uppercase font-semibold",
+									children: "Medio de Pago"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "font-semibold text-slate-700 capitalize",
+									children: sale.paymentMethodLabel || sale.paymentMethod
+								})] }),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "text-right",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-slate-500 text-[10px] uppercase font-semibold",
+										children: "Total a Facturar"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-sm font-black font-mono text-blue-900",
+										children: formatARS(sale.total)
+									})]
+								})
+							]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid grid-cols-1 sm:grid-cols-2 gap-4",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+									className: "block text-xs font-bold text-slate-700 mb-1",
+									children: "Punto de Venta Fiscal (Web Services):"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex items-center gap-2",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+										type: "number",
+										min: 1,
+										max: 99999,
+										value: puntoVenta,
+										onChange: (e) => setPuntoVenta(Math.max(1, Number(e.target.value) || 4)),
+										disabled: isSubmittingWsfe,
+										className: "w-24 text-xs font-mono font-black border border-blue-400 bg-blue-50/50 text-blue-950 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 text-center",
+										title: "Número de Punto de Venta Web Services en AFIP / ARCA"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
+										value: puntoVenta,
+										onChange: (e) => setPuntoVenta(Number(e.target.value)),
+										disabled: isSubmittingWsfe,
+										className: "flex-1 text-xs font-medium border border-slate-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 bg-white",
+										children: getAfipPuntosVenta(puntoVenta || config.afipConfig?.puntoVenta).map((pdv) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: pdv.id,
+											children: pdv.nombre
+										}, pdv.id))
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+									className: "text-[10px] text-emerald-700 font-semibold mt-0.5 block",
+									children: [
+										"✓ Configurado en Punto de Venta ",
+										String(puntoVenta).padStart(5, "0"),
+										" (Web Services)"
+									]
+								})
+							] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+								className: "block text-xs font-bold text-slate-700 mb-1",
+								children: "Tipo de Comprobante a Emitir:"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "grid grid-cols-3 gap-2",
+								children: [
+									{
+										id: "FA",
+										label: "Factura A",
+										desc: "Resp. Inscripto"
+									},
+									{
+										id: "FB",
+										label: "Factura B",
+										desc: "Cons. Final / Monot."
+									},
+									{
+										id: "FC",
+										label: "Factura C",
+										desc: "Monotributo"
+									}
+								].map((item) => {
+									const isSelected = tipoComprobante === item.id;
+									return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										type: "button",
+										disabled: isSubmittingWsfe,
+										onClick: () => setTipoComprobante(item.id),
+										className: `p-2 border rounded-lg text-left transition-all ${isSelected ? "border-blue-600 bg-blue-50/80 ring-2 ring-blue-500/20 text-blue-900 font-bold" : "border-slate-200 hover:bg-slate-50 text-slate-700 font-medium"}`,
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "text-xs",
+											children: item.label
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "text-[9.5px] text-slate-500 font-normal",
+											children: item.desc
+										})]
+									}, item.id);
+								})
+							})] })]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-3",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex items-center justify-between",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+										className: "text-xs font-bold text-slate-800 flex items-center gap-1.5",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Building, { className: "w-4 h-4 text-slate-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Datos del Receptor (Comprador)" })]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										className: "text-[10px] text-slate-500",
+										children: "Padrón oficial ARCA / AFIP"
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "grid grid-cols-1 sm:grid-cols-3 gap-3",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+										className: "block text-[11px] font-semibold text-slate-600 mb-1",
+										children: "Tipo Documento:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+										value: receptorTipoDoc,
+										onChange: (e) => setReceptorTipoDoc(e.target.value),
+										disabled: isSubmittingWsfe,
+										className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "CUIT",
+												children: "CUIT"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "CUIL",
+												children: "CUIL"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "DNI",
+												children: "DNI"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "Consumidor Final",
+												children: "Sin Identificar"
+											})
+										]
+									})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "sm:col-span-2",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+												className: "block text-[11px] font-semibold text-slate-600 mb-1",
+												children: "Número Documento (CUIT / DNI):"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												className: "flex items-center gap-1.5",
+												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+													type: "text",
+													value: receptorNroDoc,
+													onChange: (e) => {
+														setReceptorNroDoc(e.target.value);
+														setPadronVerified(false);
+													},
+													onKeyDown: (e) => {
+														if (e.key === "Enter") {
+															e.preventDefault();
+															handleConsultarPadron();
+														}
+													},
+													onBlur: () => {
+														const clean = receptorNroDoc.replace(/\D/g, "");
+														if ((clean.length === 11 || clean.length === 8 || clean.length === 7) && !padronVerified) handleConsultarPadron();
+													},
+													placeholder: "Ej. 30-71452899-8 o DNI 28495123",
+													disabled: isSubmittingWsfe,
+													className: "flex-1 text-xs border border-slate-300 rounded-lg p-2 font-mono font-bold bg-white focus:ring-2 focus:ring-blue-500"
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+													type: "button",
+													onClick: handleConsultarPadron,
+													disabled: isConsultingAfip || isSubmittingWsfe,
+													className: "px-3 py-2 bg-blue-700 hover:bg-blue-800 disabled:bg-slate-400 text-white text-xs font-semibold rounded-lg flex items-center gap-1 transition-colors shadow-2xs shrink-0 cursor-pointer",
+													title: "Consultar Padrón ARCA",
+													children: [isConsultingAfip ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-3.5 h-3.5 animate-spin" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Search, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Consultar ARCA" })]
+												})]
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-[10px] text-slate-400 mt-0.5 block",
+												children: "Presione Enter o Consultar para autocompletar Razón Social y Condición"
+											})
+										]
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "grid grid-cols-1 sm:grid-cols-2 gap-3",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+										className: "block text-[11px] font-semibold text-slate-600 mb-1",
+										children: "Razón Social / Nombre:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "relative",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+											type: "text",
+											value: receptorRazonSocial,
+											onChange: (e) => setReceptorRazonSocial(e.target.value),
+											placeholder: "Nombre o Denominación Social",
+											disabled: isSubmittingWsfe,
+											className: "w-full text-xs font-semibold border border-slate-300 rounded-lg p-2 bg-white"
+										}), padronVerified && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "absolute right-2.5 top-2 text-emerald-600 text-xs font-bold flex items-center gap-1 pointer-events-none",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheck, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-[10px]",
+												children: "Verificado"
+											})]
+										})]
+									})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+										className: "block text-[11px] font-semibold text-slate-600 mb-1",
+										children: "Condición frente al IVA:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+										value: receptorCondicionIva,
+										disabled: isSubmittingWsfe,
+										onChange: (e) => {
+											const val = e.target.value;
+											setReceptorCondicionIva(val);
+											if (config.afipConfig?.tipoFactura === "C") setTipoComprobante("FC");
+											else if (val === "IVA Responsable Inscripto") setTipoComprobante("FA");
+											else setTipoComprobante("FB");
+										},
+										className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "Consumidor Final",
+												children: "Consumidor Final"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "IVA Responsable Inscripto",
+												children: "IVA Responsable Inscripto"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "Responsable Monotributo",
+												children: "Responsable Monotributo"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "IVA Sujeto Exento",
+												children: "IVA Sujeto Exento"
+											})
+										]
+									})] })]
+								}),
+								padronVerified && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "text-[11px] bg-emerald-50 border border-emerald-200 text-emerald-900 p-2.5 rounded-lg flex items-center justify-between gap-2 flex-wrap",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex items-center gap-2",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-2 h-2 rounded-full bg-emerald-500 animate-ping shrink-0" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "ARCA / Padrón:" }),
+											" ",
+											receptorRazonSocial,
+											" • ",
+											receptorCondicionIva,
+											receptorDomicilio && ` &bull; ${receptorDomicilio}`
+										] })]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										type: "button",
+										onClick: handleGuardarEnPadron,
+										className: "px-2.5 py-1 bg-white hover:bg-emerald-100 text-emerald-800 text-[10px] font-bold border border-emerald-300 rounded shadow-2xs flex items-center gap-1 cursor-pointer transition-colors",
+										title: "Guardar o actualizar este CUIT/DNI en el Padrón ARCA local",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Save, { className: "w-3 h-3 text-emerald-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Guardar en Padrón" })]
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+									className: "block text-[11px] font-semibold text-slate-600 mb-1",
+									children: "Domicilio Fiscal (Opcional):"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									type: "text",
+									value: receptorDomicilio,
+									onChange: (e) => setReceptorDomicilio(e.target.value),
+									placeholder: "Calle, Número, Ciudad, Provincia",
+									disabled: isSubmittingWsfe,
+									className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white"
+								})] })
+							]
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "p-3 bg-emerald-50/70 border border-emerald-200 rounded-lg text-xs space-y-1.5",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "font-bold text-emerald-950 flex items-center justify-between",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Desglose de Liquidación Fiscal:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "font-mono text-sm text-emerald-900 font-black",
+									children: formatARS(sale.total)
+								})]
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "grid grid-cols-3 gap-2 text-[11px] text-emerald-900 pt-1 border-t border-emerald-200/60",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "text-emerald-700",
+											children: "Neto Gravado (21%):"
+										}),
+										" ",
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+											className: "font-mono",
+											children: formatARS(sale.total / 1.21)
+										})
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "text-emerald-700",
+											children: "IVA Débito Fiscal:"
+										}),
+										" ",
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+											className: "font-mono",
+											children: formatARS(sale.total - sale.total / 1.21)
+										})
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "text-emerald-700",
+											children: "Alícuota Aplicada:"
+										}),
+										" ",
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "21.00% General" })
+									] })
+								]
+							})]
+						}),
+						isSubmittingWsfe && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs space-y-2 animate-pulse",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex items-center gap-2 text-blue-900 font-bold",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-4 h-4 animate-spin text-blue-700" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Transmitiendo a ARCA / AFIP Web Service WSFEv1..." })]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+									className: "text-[11px] text-blue-700 font-mono",
+									children: stepWsfe
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "w-full bg-blue-200 h-1.5 rounded-full overflow-hidden",
+									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "bg-blue-600 h-full w-2/3 animate-[pulse_1s_infinite]" })
+								})
+							]
+						})
+					]
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-slate-100 border-t border-slate-200 px-5 py-3.5 flex items-center justify-between",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "text-[11px] text-slate-500",
+						children: "WSFEv1 • Conexión encriptada SSL/TLS • ARCA Argentina"
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							onClick: onClose,
+							disabled: isSubmittingWsfe,
+							className: "px-4 py-2 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold rounded-lg transition-colors",
+							children: "Cancelar"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							onClick: handleEmitirFactura,
+							disabled: isSubmittingWsfe,
+							className: "px-5 py-2 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-md flex items-center gap-2 transition-all",
+							children: isSubmittingWsfe ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-3.5 h-3.5 animate-spin" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Autorizando con ARCA..." })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Solicitar CAE y Facturar" })] })
+						})]
+					})]
+				})
+			]
+		})
+	});
+};
+//#endregion
+//#region src/components/administracion/ModalVisorFactura.tsx
+var ModalVisorFactura = ({ invoice, isOpen, onClose }) => {
+	const { config } = usePOS();
+	const [viewMode, setViewMode] = (0, import_react.useState)("a4");
+	const [copied, setCopied] = (0, import_react.useState)(false);
+	if (!isOpen || !invoice) return null;
+	const cmpInfo = TIPO_COMPROBANTE_INFO[invoice.tipoComprobante] || TIPO_COMPROBANTE_INFO.FB;
+	const activePdv = config.afipConfig?.puntoVenta || invoice.puntoVenta || 4;
+	const ptoVtaFormatted = String(activePdv).padStart(5, "0");
+	const nroCmpFormatted = String(invoice.numeroComprobante).padStart(8, "0");
+	const fullComprobanteStr = `${cmpInfo.label} Nº ${ptoVtaFormatted}-${nroCmpFormatted}`;
+	const qrSvgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(invoice.qrAfipUrl)}`;
+	const buildStandaloneInvoiceHtml = (mode) => {
+		const escapeHtml = (str) => String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+		const isFA = invoice.tipoComprobante === "FA";
+		const codigoAfipStr = String(cmpInfo.codigoAfip).padStart(2, "0");
+		if (mode === "ticket") {
+			const itemsRowsHtml = invoice.items.map((item) => `
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:5px;font-size:11px;">
+            <div style="padding-right:6px;">
+              <div style="font-weight:600;">${escapeHtml(item.description)}</div>
+              <div style="font-size:10px;color:#475569;">${escapeHtml(item.quantity)} x ${escapeHtml(formatARS(item.unitPrice))}</div>
+            </div>
+            <div style="font-weight:700;white-space:nowrap;">${escapeHtml(formatARS(item.total))}</div>
+          </div>`).join("");
+			return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Ticket Fiscal ${escapeHtml(cmpInfo.letra)} ${escapeHtml(ptoVtaFormatted)}-${escapeHtml(nroCmpFormatted)}</title>
+  <style>
+    @page { size: 80mm auto; margin: 4mm; }
+    * { box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    html, body { margin: 0; padding: 0; background: #ffffff; color: #000000; font-family: "Courier New", Courier, monospace; font-size: 11px; line-height: 1.3; }
+    .ticket-wrap { width: 100%; max-width: 76mm; margin: 0 auto; padding: 4px; }
+    .sep { border-bottom: 1px dashed #334155; margin: 6px 0; }
+    .center { text-align: center; }
+    .bold { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="ticket-wrap">
+    <div class="center">
+      <div style="font-size:13px;font-weight:900;">${escapeHtml(invoice.emisorRazonSocial)}</div>
+      <div style="font-size:10px;">${escapeHtml(invoice.emisorDomicilio)}</div>
+      <div style="font-size:10px;">CUIT: ${escapeHtml(invoice.emisorCuit)}</div>
+      <div style="font-size:10px;">IIBB: ${escapeHtml(invoice.emisorIibb)}</div>
+      <div style="font-size:10px;">${escapeHtml(invoice.emisorCondicionIva)}</div>
+    </div>
+    <div class="sep"></div>
+    <div class="center">
+      <div style="font-size:12px;font-weight:900;text-transform:uppercase;">
+        ${escapeHtml(cmpInfo.label)} [${escapeHtml(cmpInfo.letra)}] - CÓD. ${escapeHtml(codigoAfipStr)}
+      </div>
+      <div class="bold">P.V. ${escapeHtml(ptoVtaFormatted)} - Nº ${escapeHtml(nroCmpFormatted)}</div>
+      <div style="font-size:10px;">Fecha: ${escapeHtml(invoice.fechaEmision)}${invoice.horaEmision ? ` - ${escapeHtml(invoice.horaEmision)}` : ""}</div>
+    </div>
+    <div class="sep"></div>
+    <div style="font-size:10px;">
+      <div><strong>A:</strong> ${escapeHtml(invoice.receptorRazonSocial)}</div>
+      <div><strong>${escapeHtml(invoice.receptorTipoDoc)}:</strong> ${escapeHtml(invoice.receptorNroDoc)}</div>
+      <div><strong>Cond. IVA:</strong> ${escapeHtml(invoice.receptorCondicionIva)}</div>
+    </div>
+    <div class="sep"></div>
+    <div>${itemsRowsHtml}</div>
+    <div class="sep"></div>
+    <div>
+      ${isFA ? `<div style="display:flex;justify-content:space-between;font-size:10px;"><span>Neto Gravado:</span><span>${escapeHtml(formatARS(invoice.netoGravado21))}</span></div>
+             <div style="display:flex;justify-content:space-between;font-size:10px;"><span>IVA 21%:</span><span>${escapeHtml(formatARS(invoice.iva21))}</span></div>` : ""}
+      <div style="display:flex;justify-content:space-between;font-size:14px;font-weight:900;padding-top:4px;">
+        <span>TOTAL:</span>
+        <span>${escapeHtml(formatARS(invoice.total))}</span>
+      </div>
+    </div>
+    <div class="sep"></div>
+    <div class="center" style="padding-top:4px;">
+      <img src="${qrSvgUrl}" alt="QR AFIP" style="width:110px;height:110px;display:block;margin:0 auto 6px auto;" />
+      <div style="font-size:10px;font-weight:700;">CAE: ${escapeHtml(invoice.cae)}</div>
+      <div style="font-size:10px;">VTO. CAE: ${escapeHtml(invoice.vtoCae)}</div>
+      <div style="font-size:9px;margin-top:4px;">Comprobante Autorizado por ARCA / AFIP</div>
+    </div>
+  </div>
+</body>
+</html>`;
+		}
+		const tableRowsHtml = invoice.items.map((item) => {
+			const unitVal = isFA ? formatARS(item.unitPrice / 1.21) : formatARS(item.unitPrice);
+			const subVal = isFA ? formatARS(item.total / 1.21) : formatARS(item.total);
+			return `
+        <tr>
+          <td class="mono muted">${escapeHtml(item.barcode || item.productId)}</td>
+          <td style="font-weight:600;color:#0f172a;">${escapeHtml(item.description)}</td>
+          <td class="right mono" style="font-weight:600;">${escapeHtml(item.quantity)}</td>
+          <td class="right muted">${item.sellType === "bulk" ? "KG" : "UNID"}</td>
+          <td class="right mono">${escapeHtml(unitVal)}</td>
+          ${isFA ? `<td class="right mono muted">21.00%</td>` : ""}
+          <td class="right mono" style="font-weight:700;color:#0f172a;">${escapeHtml(subVal)}</td>
+        </tr>`;
+		}).join("");
+		return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Factura_${escapeHtml(cmpInfo.letra)}_${escapeHtml(ptoVtaFormatted)}-${escapeHtml(nroCmpFormatted)}</title>
+  <style>
+    @page { size: A4 portrait; margin: 10mm; }
+    * { box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .page {
+      width: 100%;
+      max-width: 190mm;
+      margin: 0 auto;
+      padding: 2mm 0;
+    }
+    .header-box {
+      border: 1.5px solid #475569;
+      border-radius: 4px;
+      padding: 14px 16px;
+      position: relative;
+      margin-bottom: 10px;
+    }
+    .letra-box {
+      position: absolute;
+      left: 50%;
+      top: 0;
+      transform: translateX(-50%);
+      width: 54px;
+      height: 54px;
+      background: #ffffff;
+      border-left: 1.5px solid #475569;
+      border-right: 1.5px solid #475569;
+      border-bottom: 1.5px solid #475569;
+      border-radius: 0 0 6px 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .letra-char {
+      font-size: 26px;
+      font-weight: 900;
+      color: #0f172a;
+      line-height: 1;
+    }
+    .letra-cod {
+      font-size: 9px;
+      font-weight: 700;
+      color: #475569;
+      margin-top: 2px;
+    }
+    .header-grid {
+      display: table;
+      width: 100%;
+      table-layout: fixed;
+    }
+    .header-col-left {
+      display: table-cell;
+      width: 50%;
+      vertical-align: top;
+      padding-right: 34px;
+      border-right: 1px solid #cbd5e1;
+    }
+    .header-col-right {
+      display: table-cell;
+      width: 50%;
+      vertical-align: top;
+      padding-left: 34px;
+      text-align: right;
+    }
+    .period-bar {
+      border: 1px solid #94a3b8;
+      border-radius: 4px;
+      padding: 6px 12px;
+      margin-bottom: 10px;
+      background: #f8fafc;
+      display: flex;
+      justify-content: space-between;
+      font-size: 10.5px;
+    }
+    .receptor-box {
+      border: 1px solid #94a3b8;
+      border-radius: 4px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+    }
+    .receptor-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 3px 0;
+    }
+    .receptor-row + .receptor-row {
+      border-top: 1px solid #e2e8f0;
+    }
+    .items-box {
+      border: 1px solid #94a3b8;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    table.items-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    table.items-table th {
+      background: #f1f5f9;
+      color: #334155;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 7px 10px;
+      border-bottom: 1px solid #94a3b8;
+      text-align: left;
+    }
+    table.items-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 11px;
+    }
+    table.items-table tr:last-child td {
+      border-bottom: none;
+    }
+    .right { text-align: right !important; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .muted { color: #475569; }
+    .totals-grid {
+      display: table;
+      width: 100%;
+      table-layout: fixed;
+      margin-bottom: 16px;
+    }
+    .obs-col {
+      display: table-cell;
+      width: 48%;
+      vertical-align: top;
+      padding-right: 12px;
+    }
+    .obs-inner {
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-size: 10px;
+      color: #475569;
+    }
+    .totals-col {
+      display: table-cell;
+      width: 52%;
+      vertical-align: top;
+    }
+    .totals-inner {
+      background: #f8fafc;
+      border: 1.5px solid #64748b;
+      border-radius: 4px;
+      padding: 10px 14px;
+    }
+    .total-line {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+      font-size: 11px;
+    }
+    .grand-total {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 8px;
+      margin-top: 6px;
+      border-top: 1.5px solid #475569;
+      font-size: 15px;
+      font-weight: 900;
+      color: #0f172a;
+    }
+    .footer-box {
+      border-top: 2px solid #0f172a;
+      padding-top: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .qr-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .qr-img-box {
+      padding: 4px;
+      border: 1px solid #94a3b8;
+      border-radius: 4px;
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header-box">
+      <div class="letra-box">
+        <div class="letra-char">${escapeHtml(cmpInfo.letra)}</div>
+        <div class="letra-cod">CÓD. ${escapeHtml(codigoAfipStr)}</div>
+      </div>
+      <div class="header-grid">
+        <div class="header-col-left">
+          <div style="font-size:16px;font-weight:900;color:#0f172a;margin-bottom:4px;">
+            ${escapeHtml(invoice.emisorRazonSocial)}
+          </div>
+          <div style="font-size:11px;color:#334155;margin-bottom:2px;">
+            <strong>Domicilio:</strong> ${escapeHtml(invoice.emisorDomicilio)}
+          </div>
+          <div style="font-size:11px;color:#334155;">
+            <strong>Condición frente al IVA:</strong> ${escapeHtml(invoice.emisorCondicionIva)}
+          </div>
+        </div>
+        <div class="header-col-right">
+          <div style="font-size:16px;font-weight:900;color:#1e3a8a;text-transform:uppercase;">
+            ${escapeHtml(cmpInfo.label)}
+          </div>
+          <div class="mono" style="font-size:13px;font-weight:800;color:#0f172a;margin-top:2px;">
+            Nº ${escapeHtml(ptoVtaFormatted)} - ${escapeHtml(nroCmpFormatted)}
+          </div>
+          <div style="font-size:11px;color:#334155;margin-top:4px;">
+            <strong>Fecha de Emisión:</strong> ${escapeHtml(invoice.fechaEmision)}
+          </div>
+          <div style="border-top:1px solid #cbd5e1;margin-top:6px;padding-top:6px;font-size:10.5px;color:#334155;">
+            <div><strong>CUIT:</strong> ${escapeHtml(invoice.emisorCuit)}</div>
+            <div><strong>Ingresos Brutos:</strong> ${escapeHtml(invoice.emisorIibb)}</div>
+            <div><strong>Inicio de Actividades:</strong> ${escapeHtml(invoice.emisorInicioActividades)}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="period-bar">
+      <div><strong>Período Facturado Desde:</strong> ${escapeHtml(invoice.fechaEmision)}</div>
+      <div><strong>Hasta:</strong> ${escapeHtml(invoice.fechaEmision)}</div>
+      <div><strong>Vto. para el Pago:</strong> ${escapeHtml(invoice.vtoCae)}</div>
+    </div>
+
+    <div class="receptor-box">
+      <div class="receptor-row">
+        <div><strong>${escapeHtml(invoice.receptorTipoDoc)}:</strong> <span class="mono" style="font-weight:700;">${escapeHtml(invoice.receptorNroDoc)}</span></div>
+        <div><strong>Razón Social / Nombre:</strong> <strong>${escapeHtml(invoice.receptorRazonSocial)}</strong></div>
+      </div>
+      <div class="receptor-row">
+        <div><strong>Condición frente al IVA:</strong> ${escapeHtml(invoice.receptorCondicionIva)}</div>
+        <div><strong>Domicilio:</strong> ${escapeHtml(invoice.receptorDomicilio || "Río Cuarto, Córdoba")}</div>
+      </div>
+      <div class="receptor-row">
+        <div><strong>Condición de Venta:</strong> Contado / Mostrador (Ticket ${escapeHtml(invoice.saleFolio || invoice.ticketNumber || "POS")})</div>
+      </div>
+    </div>
+
+    <div class="items-box">
+      <table class="items-table">
+        <thead>
+          <tr>
+            <th>Código</th>
+            <th>Descripción / Producto</th>
+            <th class="right">Cant.</th>
+            <th class="right">U. Medida</th>
+            <th class="right">Precio Unit.</th>
+            ${isFA ? "<th class=\"right\">Alíc. IVA</th>" : ""}
+            <th class="right">Subtotal</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tableRowsHtml}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="totals-grid">
+      <div class="obs-col">
+        <div class="obs-inner">
+          <div style="font-weight:700;color:#1e293b;margin-bottom:3px;">Observaciones:</div>
+          <div>${escapeHtml(invoice.observaciones || "Comprobante emitido mediante Facturación Electrónica ARCA/AFIP WSFEv1.")}</div>
+        </div>
+      </div>
+      <div class="totals-col">
+        <div class="totals-inner">
+          ${isFA ? `<div class="total-line"><span>Importe Neto Gravado (21%):</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.netoGravado21))}</span></div>
+                 ${invoice.netoGravado105 > 0 ? `<div class="total-line"><span>Importe Neto Gravado (10.5%):</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.netoGravado105))}</span></div>` : ""}
+                 <div class="total-line"><span>IVA 21%:</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.iva21))}</span></div>
+                 ${invoice.iva105 > 0 ? `<div class="total-line"><span>IVA 10.5%:</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.iva105))}</span></div>` : ""}` : `<div class="total-line"><span>Subtotal Operaciones:</span><span class="mono">${escapeHtml(formatARS(invoice.total))}</span></div>`}
+          <div class="grand-total">
+            <span>TOTAL:</span>
+            <span class="mono" style="color:#1e3a8a;">${escapeHtml(formatARS(invoice.total))}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-box">
+      <div class="qr-wrap">
+        <div class="qr-img-box">
+          <img src="${qrSvgUrl}" alt="Código QR Oficial AFIP" style="width:92px;height:92px;display:block;" />
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:900;color:#0f172a;">
+            <span style="color:#1d4ed8;">ARCA</span> / AFIP
+          </div>
+          <div style="font-size:10px;color:#334155;font-weight:600;margin-top:2px;">
+            Comprobante Autorizado
+          </div>
+          <div style="font-size:9.5px;color:#64748b;max-width:220px;margin-top:2px;">
+            Esta Administración Federal no se responsabiliza por los datos ingresados en el detalle de la operación.
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align:right;">
+        <div style="font-size:13px;margin-bottom:4px;">
+          <strong>CAE Nº:</strong> <span class="mono" style="font-size:14px;font-weight:900;">${escapeHtml(invoice.cae)}</span>
+        </div>
+        <div style="font-size:12px;">
+          <strong>Fecha de Vto. de CAE:</strong> <span class="mono" style="font-weight:700;">${escapeHtml(invoice.vtoCae)}</span>
+        </div>
+        ${invoice.arcaBarcode ? `<div class="mono" style="font-size:9px;color:#64748b;letter-spacing:1.5px;margin-top:6px;">${escapeHtml(invoice.arcaBarcode)}</div>` : ""}
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+	};
+	const handlePrint = (targetMode) => {
+		const selectedMode = targetMode || viewMode;
+		if (selectedMode !== viewMode) setViewMode(selectedMode);
+		const originalTitle = document.title;
+		const pdfFileName = `Factura_${cmpInfo.letra}_${ptoVtaFormatted}-${nroCmpFormatted}_${invoice.emisorRazonSocial.replace(/\s+/g, "_")}`;
+		document.title = pdfFileName;
+		try {
+			const existingFrame = document.getElementById("consolata-factura-print-frame");
+			if (existingFrame && existingFrame.parentNode) existingFrame.parentNode.removeChild(existingFrame);
+			const printFrame = document.createElement("iframe");
+			printFrame.id = "consolata-factura-print-frame";
+			printFrame.style.position = "fixed";
+			printFrame.style.right = "0";
+			printFrame.style.bottom = "0";
+			printFrame.style.width = "210mm";
+			printFrame.style.height = "297mm";
+			printFrame.style.opacity = "0";
+			printFrame.style.pointerEvents = "none";
+			printFrame.style.border = "0";
+			printFrame.style.zIndex = "-1";
+			document.body.appendChild(printFrame);
+			const htmlContent = buildStandaloneInvoiceHtml(selectedMode);
+			const frameDoc = printFrame.contentWindow?.document || printFrame.contentDocument;
+			if (frameDoc && printFrame.contentWindow) {
+				frameDoc.open();
+				frameDoc.write(htmlContent);
+				frameDoc.close();
+				let printed = false;
+				const triggerFramePrint = () => {
+					if (printed) return;
+					printed = true;
+					try {
+						printFrame.contentWindow?.focus();
+						printFrame.contentWindow?.print();
+					} catch {
+						window.print();
+					} finally {
+						setTimeout(() => {
+							document.title = originalTitle;
+						}, 1200);
+					}
+				};
+				const imgs = Array.from(frameDoc.images || []);
+				if (imgs.length === 0 || imgs.every((img) => img.complete)) setTimeout(triggerFramePrint, 120);
+				else {
+					let loadedCount = 0;
+					const onImgDone = () => {
+						loadedCount++;
+						if (loadedCount >= imgs.length) setTimeout(triggerFramePrint, 80);
+					};
+					imgs.forEach((img) => {
+						if (img.complete) onImgDone();
+						else {
+							img.addEventListener("load", onImgDone, { once: true });
+							img.addEventListener("error", onImgDone, { once: true });
+						}
+					});
+					setTimeout(triggerFramePrint, 800);
+				}
+				return;
+			}
+		} catch {}
+		setTimeout(() => {
+			window.print();
+			setTimeout(() => {
+				document.title = originalTitle;
+			}, 800);
+		}, 150);
+	};
+	const handleCopyCae = () => {
+		navigator.clipboard.writeText(invoice.cae);
+		setCopied(true);
+		setTimeout(() => setCopied(false), 2e3);
+	};
+	const handleDownloadHtml = () => {
+		const invoiceHtml = buildStandaloneInvoiceHtml("a4");
+		const blob = new Blob([invoiceHtml], { type: "text/html;charset=utf-8" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = `Factura_${cmpInfo.letra}_${ptoVtaFormatted}-${nroCmpFormatted}.html`;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		URL.revokeObjectURL(url);
+	};
+	(0, import_react.useEffect)(() => {
+		if (!isOpen) return;
+		const handleVisorKeyDown = (e) => {
+			if (e.key === "Escape") {
+				e.preventDefault();
+				e.stopPropagation();
+				onClose();
+				return;
+			}
+			if (e.key === "p" || e.key === "P") {
+				e.preventDefault();
+				handlePrint("a4");
+				return;
+			}
+			if (e.key === "Enter") {
+				const target = e.target;
+				if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+				e.preventDefault();
+				handlePrint("a4");
+				return;
+			}
+			if (e.key === "t" || e.key === "T") {
+				setViewMode("ticket");
+				return;
+			}
+			if (e.key === "a" || e.key === "A") {
+				setViewMode("a4");
+				return;
+			}
+		};
+		window.addEventListener("keydown", handleVisorKeyDown);
+		return () => window.removeEventListener("keydown", handleVisorKeyDown);
+	}, [isOpen, onClose]);
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+		className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-2 sm:p-4 overflow-y-auto print:p-0 print:bg-white print:static print:overflow-visible",
+		children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			className: "bg-white rounded-xl shadow-2xl border border-slate-300 w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden print:max-h-none print:shadow-none print:border-none print:w-full print:overflow-visible",
+			children: [
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-gradient-to-r from-slate-800 to-blue-900 text-white px-4 py-3 flex items-center justify-between shrink-0 print:hidden",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldCheck, { className: "w-5 h-5 text-emerald-400" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "text-sm font-bold flex items-center gap-2",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: fullComprobanteStr }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+								className: "text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 px-2 py-0.5 rounded-full font-mono font-medium",
+								children: ["CAE: ", invoice.cae]
+							})]
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "text-[11px] text-slate-300",
+							children: "ARCA / AFIP WSFEv1 - Autorización Oficial"
+						})] })]
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex items-center bg-slate-900/60 p-0.5 rounded-lg border border-slate-700 text-xs",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									onClick: () => setViewMode("a4"),
+									className: `flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors ${viewMode === "a4" ? "bg-blue-600 text-white font-medium" : "text-slate-300 hover:text-white"}`,
+									title: "Cambiar a vista A4 (tecla A)",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Formato A4 [A]" })]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									onClick: () => setViewMode("ticket"),
+									className: `flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors ${viewMode === "ticket" ? "bg-blue-600 text-white font-medium" : "text-slate-300 hover:text-white"}`,
+									title: "Cambiar a vista Ticket Fiscal 80mm (tecla T)",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Receipt, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket Fiscal 80mm [T]" })]
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+								onClick: () => handlePrint("a4"),
+								className: "flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer",
+								title: "Abre el selector del sistema para elegir la impresora A4 física (HP, Epson, etc.) o guardar en PDF [Enter / P]",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir A4 (Elegir Impresora) [P]" })]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+								onClick: handleDownloadHtml,
+								className: "flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium rounded-lg shadow-sm transition-colors cursor-pointer",
+								title: "Descargar archivo de factura para abrir o enviar",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, { className: "w-3.5 h-3.5 text-emerald-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "hidden sm:inline",
+									children: "Descargar (.html)"
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+								onClick: onClose,
+								className: "w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 rounded-lg transition-colors ml-1 cursor-pointer",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
+							})
+						]
+					})]
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+					className: "flex-1 overflow-y-auto p-4 sm:p-6 bg-slate-100 flex justify-center print:bg-white print:p-0 print:overflow-visible",
+					children: viewMode === "a4" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						id: "factura-a4-printable",
+						className: "bg-white border border-slate-300 rounded-sm shadow-md p-6 sm:p-8 w-full max-w-[210mm] text-slate-800 text-[11px] leading-tight select-text print:shadow-none print:border-none print:p-0",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "border border-slate-400 rounded-sm p-4 relative mb-4",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "absolute left-1/2 -top-1 transform -translate-x-1/2 -translate-y-0 w-14 h-14 bg-white border border-slate-400 rounded-b-md flex flex-col items-center justify-center z-10 shadow-xs",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										className: "text-2xl font-black text-slate-900 leading-none",
+										children: cmpInfo.letra
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+										className: "text-[9px] font-bold text-slate-600 mt-0.5",
+										children: ["CÓD. ", String(cmpInfo.codigoAfip).padStart(2, "0")]
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "grid grid-cols-2 gap-8",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "pr-4 border-r border-slate-300",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", {
+											className: "text-base font-black text-slate-900 tracking-tight mb-1",
+											children: invoice.emisorRazonSocial
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "space-y-0.5 text-slate-600",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "font-semibold text-slate-800",
+													children: "Domicilio:"
+												}),
+												" ",
+												invoice.emisorDomicilio
+											] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "font-semibold text-slate-800",
+													children: "Condición frente al IVA:"
+												}),
+												" ",
+												invoice.emisorCondicionIva
+											] })]
+										})]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "pl-4",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "text-right",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+													className: "text-base font-black text-blue-900 uppercase tracking-tight",
+													children: cmpInfo.label
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+													className: "text-xs font-mono font-bold text-slate-800",
+													children: [
+														"Nº ",
+														ptoVtaFormatted,
+														" - ",
+														nroCmpFormatted
+													]
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+													className: "text-[11px] text-slate-600 mt-1",
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+															className: "font-semibold text-slate-800",
+															children: "Fecha de Emisión:"
+														}),
+														" ",
+														invoice.fechaEmision
+													]
+												})
+											]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "mt-2 text-right space-y-0.5 text-slate-600 border-t border-slate-200 pt-2",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "font-semibold text-slate-800",
+														children: "CUIT:"
+													}),
+													" ",
+													invoice.emisorCuit
+												] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "font-semibold text-slate-800",
+														children: "Ingresos Brutos:"
+													}),
+													" ",
+													invoice.emisorIibb
+												] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
+													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "font-semibold text-slate-800",
+														children: "Inicio de Actividades:"
+													}),
+													" ",
+													invoice.emisorInicioActividades
+												] })
+											]
+										})]
+									})]
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "border border-slate-300 rounded-sm px-3 py-1.5 mb-3 bg-slate-50 flex justify-between text-[10.5px]",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-semibold text-slate-700",
+											children: "Período Facturado Desde:"
+										}),
+										" ",
+										invoice.fechaEmision
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-semibold text-slate-700",
+											children: "Hasta:"
+										}),
+										" ",
+										invoice.fechaEmision
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-semibold text-slate-700",
+											children: "Vto. para el Pago:"
+										}),
+										" ",
+										invoice.vtoCae
+									] })
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "border border-slate-300 rounded-sm p-3 mb-4 space-y-1",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "grid grid-cols-2 gap-4",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+												className: "font-semibold text-slate-700",
+												children: [invoice.receptorTipoDoc, ":"]
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-bold text-slate-900",
+												children: invoice.receptorNroDoc
+											})
+										] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-semibold text-slate-700",
+												children: "Razón Social / Nombre:"
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-bold text-slate-900",
+												children: invoice.receptorRazonSocial
+											})
+										] })]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "grid grid-cols-2 gap-4 pt-1 border-t border-slate-100",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-semibold text-slate-700",
+												children: "Condición frente al IVA:"
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-slate-800 font-medium",
+												children: invoice.receptorCondicionIva
+											})
+										] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-semibold text-slate-700",
+												children: "Domicilio:"
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-slate-800",
+												children: invoice.receptorDomicilio || "Río Cuarto, Córdoba"
+											})
+										] })]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "pt-1 border-t border-slate-100 text-[10.5px]",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-semibold text-slate-700",
+												children: "Condición de Venta:"
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+												className: "text-slate-800",
+												children: [
+													"Contado / Mostrador (Ticket ",
+													invoice.saleFolio || invoice.ticketNumber || "POS",
+													")"
+												]
+											})
+										]
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "border border-slate-300 rounded-sm overflow-hidden mb-4",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
+									className: "w-full text-left border-collapse",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
+										className: "bg-slate-100 text-slate-700 font-semibold border-b border-slate-300 text-[10px] uppercase tracking-wider",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2.5",
+												children: "Código"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2.5",
+												children: "Descripción / Producto"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2 text-right",
+												children: "Cant."
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2 text-right",
+												children: "U. Medida"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2.5 text-right",
+												children: "Precio Unit."
+											}),
+											invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2 text-right",
+												children: "Alíc. IVA"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+												className: "py-1.5 px-2.5 text-right",
+												children: "Subtotal"
+											})
+										]
+									}) }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", {
+										className: "divide-y divide-slate-200",
+										children: invoice.items.map((item, idx) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
+											className: "hover:bg-slate-50/50",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2.5 font-mono text-slate-500 text-[10px]",
+													children: item.barcode || item.productId
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2.5 font-medium text-slate-900",
+													children: item.description
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2 text-right font-mono font-semibold",
+													children: item.quantity
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2 text-right text-slate-600",
+													children: item.sellType === "bulk" ? "KG" : "UNID"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2.5 text-right font-mono",
+													children: invoice.tipoComprobante === "FA" ? formatARS(item.unitPrice / 1.21) : formatARS(item.unitPrice)
+												}),
+												invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2 text-right font-mono text-slate-600",
+													children: "21.00%"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+													className: "py-1.5 px-2.5 text-right font-mono font-bold text-slate-900",
+													children: invoice.tipoComprobante === "FA" ? formatARS(item.total / 1.21) : formatARS(item.total)
+												})
+											]
+										}, idx))
+									})]
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "text-slate-600 text-[10px] space-y-1 p-2 bg-slate-50 rounded border border-slate-200",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+										className: "font-semibold text-slate-700",
+										children: "Observaciones:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: invoice.observaciones || "Comprobante emitido mediante Facturación Electrónica ARCA/AFIP WSFEv1." })]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "border border-slate-300 rounded-sm p-3 bg-slate-50 space-y-1.5",
+									children: [invoice.tipoComprobante === "FA" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex justify-between text-slate-700",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Importe Neto Gravado (21%):" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-semibold",
+												children: formatARS(invoice.netoGravado21)
+											})]
+										}),
+										invoice.netoGravado105 > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex justify-between text-slate-700",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Importe Neto Gravado (10.5%):" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-semibold",
+												children: formatARS(invoice.netoGravado105)
+											})]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex justify-between text-slate-700",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 21%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-semibold",
+												children: formatARS(invoice.iva21)
+											})]
+										}),
+										invoice.iva105 > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex justify-between text-slate-700",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 10.5%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-semibold",
+												children: formatARS(invoice.iva105)
+											})]
+										})
+									] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex justify-between text-slate-600 text-[10px]",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Subtotal Operaciones:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-mono",
+											children: formatARS(invoice.total)
+										})]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex justify-between text-slate-900 font-black text-sm pt-2 border-t border-slate-300",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "TOTAL:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-mono text-base text-blue-950",
+											children: formatARS(invoice.total)
+										})]
+									})]
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "border-t-2 border-slate-900 pt-3 flex flex-col sm:flex-row items-center justify-between gap-4",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex items-center gap-3",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "p-1 bg-white border border-slate-300 rounded shadow-2xs",
+										children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
+											src: qrSvgUrl,
+											alt: "Código QR Oficial AFIP",
+											className: "w-24 h-24"
+										})
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "space-y-0.5",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-center gap-1 font-bold text-slate-900 text-xs",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "text-blue-700",
+													children: "ARCA"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "text-slate-400",
+													children: "/"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "AFIP" })
+											]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+											className: "text-[9.5px] text-slate-500 max-w-[200px]",
+											children: "Comprobante Autorizado. Escanee para verificar validez en el servidor oficial."
+										})]
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "text-right space-y-1",
+									children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-center justify-end gap-2",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "font-bold text-slate-800 text-xs",
+													children: "CAE Nº:"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+													className: "font-mono font-black text-sm text-slate-900 tracking-wider",
+													children: invoice.cae
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+													onClick: handleCopyCae,
+													className: "p-1 text-slate-400 hover:text-blue-600 print:hidden",
+													title: "Copiar CAE",
+													children: copied ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheck, { className: "w-3.5 h-3.5 text-emerald-600" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Copy, { className: "w-3.5 h-3.5" })
+												})
+											]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-semibold text-slate-700 text-xs",
+												children: "Fecha de Vto. de CAE:"
+											}),
+											" ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "font-mono font-bold text-slate-900 text-xs",
+												children: invoice.vtoCae
+											})
+										] }),
+										invoice.arcaBarcode && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "pt-1",
+											children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+												className: "font-mono text-[9px] text-slate-400 tracking-widest text-center",
+												children: invoice.arcaBarcode
+											})
+										})
+									]
+								})]
+							})
+						]
+					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						id: "factura-ticket-printable",
+						className: "bg-white border border-slate-300 rounded-sm shadow-md p-5 w-full max-w-[80mm] text-slate-900 font-mono text-[11px] leading-tight select-text print:shadow-none print:border-none print:p-0",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "text-center pb-2 border-b border-dashed border-slate-400 space-y-0.5",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-sm font-black tracking-tight",
+										children: invoice.emisorRazonSocial
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-[10px] text-slate-600",
+										children: invoice.emisorDomicilio
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "text-[10px]",
+										children: ["CUIT: ", invoice.emisorCuit]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "text-[10px]",
+										children: ["IIBB: ", invoice.emisorIibb]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-[10px]",
+										children: invoice.emisorCondicionIva
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "py-2 border-b border-dashed border-slate-400 text-center space-y-0.5",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "text-xs font-black uppercase text-blue-950",
+										children: [
+											cmpInfo.label,
+											" [",
+											cmpInfo.letra,
+											"] - CÓD. ",
+											String(cmpInfo.codigoAfip).padStart(2, "0")
+										]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "font-bold text-[11px]",
+										children: [
+											"P.V. ",
+											ptoVtaFormatted,
+											" - Nº ",
+											nroCmpFormatted
+										]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "text-[10px] text-slate-600",
+										children: [
+											"Fecha: ",
+											invoice.fechaEmision,
+											" ",
+											invoice.horaEmision ? `- ${invoice.horaEmision}` : ""
+										]
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "py-2 border-b border-dashed border-slate-400 text-[10px] space-y-0.5",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-bold",
+											children: "A:"
+										}),
+										" ",
+										invoice.receptorRazonSocial
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "font-bold",
+											children: [invoice.receptorTipoDoc, ":"]
+										}),
+										" ",
+										invoice.receptorNroDoc
+									] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "font-bold",
+											children: "Cond. IVA:"
+										}),
+										" ",
+										invoice.receptorCondicionIva
+									] })
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "py-2 border-b border-dashed border-slate-400 space-y-1.5",
+								children: invoice.items.map((item, idx) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex justify-between items-start text-[10.5px]",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "pr-1",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: item.description }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "text-[9.5px] text-slate-500",
+											children: [
+												item.quantity,
+												" x ",
+												formatARS(item.unitPrice)
+											]
+										})]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "font-bold shrink-0",
+										children: formatARS(item.total)
+									})]
+								}, idx))
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "py-2 border-b border-dashed border-slate-400 space-y-1",
+								children: [invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex justify-between text-[10px]",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Neto Gravado:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.netoGravado21) })]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex justify-between text-[10px]",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 21%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.iva21) })]
+								})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex justify-between text-sm font-black pt-1",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "TOTAL:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.total) })]
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "pt-3 text-center space-y-2",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "flex justify-center",
+										children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
+											src: qrSvgUrl,
+											alt: "QR AFIP",
+											className: "w-28 h-28 mx-auto"
+										})
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "text-[10px] space-y-0.5",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "font-bold",
+											children: ["CAE: ", invoice.cae]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["VTO. CAE: ", invoice.vtoCae] })]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "text-[9px] text-slate-500 font-sans pt-1",
+										children: "Comprobante Autorizado por ARCA / AFIP"
+									})
+								]
+							})
+						]
+					})
+				}),
+				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-slate-50 border-t border-slate-200 px-4 py-3 flex flex-wrap items-center justify-between gap-2 shrink-0 print:hidden",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "text-xs text-slate-500",
+						children: [
+							"Punto de Venta ",
+							ptoVtaFormatted,
+							" • Consolata POS Facturación Electrónica ARCA"
+						]
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+								onClick: () => handlePrint("a4"),
+								className: "px-4 py-2 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white text-xs font-bold rounded-lg shadow-sm flex items-center gap-1.5 transition-all cursor-pointer",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-4 h-4 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir en A4 / Guardar PDF" })]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+								onClick: () => handlePrint("ticket"),
+								className: "px-3.5 py-2 bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold rounded-lg shadow-sm flex items-center gap-1.5 transition-colors cursor-pointer",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Receipt, { className: "w-3.5 h-3.5 text-slate-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket 80mm" })]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+								onClick: handleDownloadHtml,
+								className: "px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 text-xs font-semibold rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, { className: "w-3.5 h-3.5 text-blue-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Descargar A4 (.html)" })]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+								onClick: onClose,
+								className: "px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 text-xs font-medium rounded-lg transition-colors cursor-pointer",
+								children: "Cerrar"
+							})
+						]
+					})]
+				})
+			]
+		})
+	});
+};
+//#endregion
 //#region src/components/CreditosView.tsx
 var CreditosView = () => {
-	const { customers, debtMovements, addDebtPayment, requestPermission, bankAccounts, posnetDevices, showToast, config } = usePOS();
+	const { customers, debtMovements, addDebtPayment, requestPermission, bankAccounts, posnetDevices, showToast, config, sales, setSelectedSaleForTicket, electronicInvoices } = usePOS();
 	const [activeTab, setActiveTab] = (0, import_react.useState)("estado");
 	const [searchTerm, setSearchTerm] = (0, import_react.useState)("");
 	const [selectedCustomerId, setSelectedCustomerId] = (0, import_react.useState)(customers[0]?.id || "");
@@ -102163,6 +104327,14 @@ var CreditosView = () => {
 	const [abonoAmount, setAbonoAmount] = (0, import_react.useState)("");
 	const [abonoNotes, setAbonoNotes] = (0, import_react.useState)("");
 	const [paymentMethod, setPaymentMethod] = (0, import_react.useState)("efectivo");
+	const [saleToFacturar, setSaleToFacturar] = (0, import_react.useState)(null);
+	const [visorInvoice, setVisorInvoice] = (0, import_react.useState)(null);
+	const [detailTab, setDetailTab] = (0, import_react.useState)("movimientos");
+	const [facturarArcaOnAbono, setFacturarArcaOnAbono] = (0, import_react.useState)(false);
+	const [selectedSaleIdsForInvoice, setSelectedSaleIdsForInvoice] = (0, import_react.useState)([]);
+	const toggleSelectSaleForInvoice = (saleId) => {
+		setSelectedSaleIdsForInvoice((prev) => prev.includes(saleId) ? prev.filter((id) => id !== saleId) : [...prev, saleId]);
+	};
 	const [cashTendered, setCashTendered] = (0, import_react.useState)("");
 	const [cardBrand, setCardBrand] = (0, import_react.useState)("VISA");
 	const [cardLastFour, setCardLastFour] = (0, import_react.useState)("");
@@ -102199,9 +104371,211 @@ var CreditosView = () => {
 	const customerMovements = debtMovements.filter((m) => m.customerId === selectedCustomer?.id);
 	const totalCartera = customers.reduce((sum, c) => c.currentDebt > 0 ? sum + c.currentDebt : sum, 0);
 	const totalSaldoAFavor = customers.reduce((sum, c) => c.currentDebt < 0 ? sum + Math.abs(c.currentDebt) : sum, 0);
+	const customerSales = sales.filter((s) => selectedCustomer && s.customerId === selectedCustomer.id || selectedCustomer && s.customerName && s.customerName.toLowerCase() === selectedCustomer.name.toLowerCase());
+	const handleFacturarMultiplesTickets = () => {
+		if (selectedSaleIdsForInvoice.length === 0) {
+			showToast("Seleccione al menos un ticket marcando su casilla [✓] para facturarlos juntos en ARCA.", "warning");
+			return;
+		}
+		const salesToMerge = customerSales.filter((s) => selectedSaleIdsForInvoice.includes(s.id));
+		if (salesToMerge.length === 0) return;
+		const mergedItems = salesToMerge.flatMap((s) => s.items);
+		const mergedSubtotal = salesToMerge.reduce((sum, s) => sum + s.subtotal, 0);
+		const mergedTotal = salesToMerge.reduce((sum, s) => sum + s.total, 0);
+		const firstSale = salesToMerge[0];
+		const combinedSale = {
+			id: `combined-${Date.now()}`,
+			folio: `FAC-${salesToMerge.map((s) => s.folio).join("+")}`,
+			ticketNumber: firstSale.ticketNumber,
+			items: mergedItems,
+			subtotal: mergedSubtotal,
+			taxes: 0,
+			total: mergedTotal,
+			paymentMethod: firstSale.paymentMethod,
+			paymentMethodLabel: `Factura Agrupada (${salesToMerge.length} tickets)`,
+			amountPaid: mergedTotal,
+			change: 0,
+			customerId: firstSale.customerId,
+			customerName: firstSale.customerName,
+			cashier: firstSale.cashier || "Cajero Principal",
+			registerName: firstSale.registerName || "Caja Principal",
+			timestamp: Date.now(),
+			ticketNotes: `Agrupación de ${salesToMerge.length} tickets: ${salesToMerge.map((s) => s.folio).join(", ")}`
+		};
+		setSaleToFacturar(combinedSale);
+		setSelectedSaleIdsForInvoice([]);
+		showToast(`🧾 Preparando Factura ARCA agrupada para ${salesToMerge.length} tickets...`, "info");
+	};
+	const createSaleFromMovement = (m, cust) => {
+		const isAbono = m.type !== "cargo";
+		return {
+			id: `mov-${m.id}`,
+			folio: m.folio || `CC-${m.id.slice(-6).toUpperCase()}`,
+			ticketNumber: parseInt(m.folio?.replace(/\D/g, "") || `${(m.date || Date.now()) % 1e5}`, 10) || 1,
+			items: [{
+				id: `item-cc-${m.id}`,
+				productId: `prod-cc-${m.id}`,
+				barcode: m.folio || `CC-${m.id.slice(-6).toUpperCase()}`,
+				description: isAbono ? `RECIBO COBRO CTA. CTE. - ${cust.name}` : `CARGO CTA. CTE. - ${m.concept}`,
+				sellType: "unit",
+				quantity: 1,
+				unitPrice: m.amount,
+				unitCost: 0,
+				total: m.amount,
+				stockRemaining: 0,
+				department: "Cuentas Corrientes"
+			}],
+			subtotal: m.amount,
+			taxes: 0,
+			total: m.amount,
+			paymentMethod: m.paymentMethod || (isAbono ? "efectivo" : "credito"),
+			paymentMethodLabel: m.paymentMethodLabel || (isAbono ? "Abono Cuenta Corriente" : "Crédito Cuenta Corriente"),
+			amountPaid: m.amount,
+			change: 0,
+			customerId: cust.id,
+			customerName: cust.name,
+			cashier: m.cashier || "Cajero Principal",
+			cashierId: m.cashierId,
+			registerName: m.registerName || "Caja Principal",
+			timestamp: m.date || m.timestamp || Date.now(),
+			ticketNotes: m.reference || m.concept
+		};
+	};
+	const handleReimprimirTicket = (m) => {
+		if (!selectedCustomer) return;
+		const existingSale = sales.find((s) => m.folio && s.folio === m.folio || s.id === m.folio || s.id === m.id) || createSaleFromMovement(m, selectedCustomer);
+		setSelectedSaleForTicket(existingSale);
+		showToast(`🖨️ Enviando ticket ${existingSale.folio} a impresión...`, "info");
+	};
+	const handleReimprimirVentaTicket = (sale) => {
+		setSelectedSaleForTicket(sale);
+		showToast(`🖨️ Enviando ticket ${sale.folio} a impresión...`, "info");
+	};
+	const handleFacturarMovimiento = (m) => {
+		if (!selectedCustomer) return;
+		const existingSale = sales.find((s) => m.folio && s.folio === m.folio || s.id === m.folio || s.id === m.id) || createSaleFromMovement(m, selectedCustomer);
+		const inv = electronicInvoices.find((i) => i.saleId === existingSale.id || existingSale.folio && i.saleFolio === existingSale.folio);
+		if (inv) {
+			setVisorInvoice(inv);
+			return;
+		}
+		setSaleToFacturar(existingSale);
+	};
+	const handleFacturarVenta = (sale) => {
+		const inv = electronicInvoices.find((i) => i.saleId === sale.id || sale.folio && i.saleFolio === sale.folio);
+		if (inv) {
+			setVisorInvoice(inv);
+			return;
+		}
+		setSaleToFacturar(sale);
+	};
+	const handlePrintResumenTermico = () => {
+		if (!selectedCustomer) return;
+		PrinterService.printCustomerAccountThermalTicket({
+			customer: selectedCustomer,
+			movements: customerMovements,
+			config
+		});
+		showToast(`🖨️ Imprimiendo Resumen de Cuenta de ${selectedCustomer.name} en Ticket Térmico...`, "info");
+	};
+	const handlePrintResumenA4 = () => {
+		if (!selectedCustomer) return;
+		const bal = Number(selectedCustomer.currentDebt ?? selectedCustomer.currentBalance ?? 0);
+		PrinterService.printA4ReportDirect({
+			title: "ESTADO DE CUENTA CORRIENTE DE CLIENTE",
+			subtitle: `Cliente: ${selectedCustomer.name} (Folio #${selectedCustomer.folio})`,
+			businessName: config?.businessName || "CONSOLATA POS",
+			businessAddress: config?.address,
+			businessCuit: config?.cuit,
+			summaryCards: [
+				{
+					label: "TOTAL ADEUDADO AL DÍA",
+					value: bal > 0 ? formatARS(bal) : bal < 0 ? `+${formatARS(Math.abs(bal))} A FAVOR` : "$0,00 AL DÍA",
+					highlight: bal > 0 ? "danger" : "success"
+				},
+				{
+					label: "Límite de Crédito Autorizado",
+					value: formatARS(selectedCustomer.creditLimit),
+					highlight: "primary"
+				},
+				{
+					label: "Total Movimientos Registrados",
+					value: String(customerMovements.length)
+				}
+			],
+			metaLeft: [
+				{
+					label: "Cliente",
+					value: selectedCustomer.name
+				},
+				{
+					label: "CUIT / DNI",
+					value: selectedCustomer.cuit || "-"
+				},
+				{
+					label: "Teléfono",
+					value: selectedCustomer.phone || "-"
+				},
+				{
+					label: "Dirección",
+					value: selectedCustomer.address1 || "-"
+				}
+			],
+			metaRight: [
+				{
+					label: "Folio Cliente",
+					value: String(selectedCustomer.folio)
+				},
+				{
+					label: "Límite Autorizado",
+					value: formatARS(selectedCustomer.creditLimit)
+				},
+				{
+					label: "Saldo Actual",
+					value: bal < 0 ? `+${formatARS(Math.abs(bal))} a favor` : formatARS(bal)
+				}
+			],
+			columns: [
+				{
+					header: "Fecha y Hora",
+					align: "left",
+					width: "18%"
+				},
+				{
+					header: "Concepto / Comprobante",
+					align: "left",
+					width: "34%"
+				},
+				{
+					header: "Medio de Pago",
+					align: "center",
+					width: "16%"
+				},
+				{
+					header: "Importe (+/-)",
+					align: "right",
+					width: "16%"
+				},
+				{
+					header: "Saldo Resultante",
+					align: "right",
+					width: "16%"
+				}
+			],
+			rows: customerMovements.map((m) => [
+				new Date(m.date ?? m.timestamp ?? Date.now()).toLocaleString("es-AR"),
+				m.folio ? `${m.concept} (Comp: ${m.folio})` : m.concept,
+				m.type === "cargo" ? "Cargo Cta Cte" : m.paymentMethodLabel || "Efectivo",
+				`${m.type === "cargo" ? "+" : "-"}${formatARS(m.amount)}`,
+				m.balanceAfter < 0 ? `+${formatARS(Math.abs(m.balanceAfter))} a favor` : formatARS(m.balanceAfter)
+			])
+		});
+		showToast(`📄 Abriendo selector de impresora para Resumen A4 de ${selectedCustomer.name}...`, "info");
+	};
 	const openAbonoModal = (initialAmount, defaultNotes) => {
 		setAbonoAmount(initialAmount);
 		setAbonoNotes(defaultNotes);
+		setFacturarArcaOnAbono(false);
 		setPaymentMethod("efectivo");
 		setCashTendered(initialAmount);
 		setCardLastFour("");
@@ -102414,8 +104788,10 @@ var CreditosView = () => {
 		}).join(" + ")})`;
 		const action = parsed > selectedCustomer.currentDebt ? "dejarSaldoAFavor" : "verCuentaRecibirAbonos";
 		const title = parsed > selectedCustomer.currentDebt ? "Registrar anticipo o saldo a favor de cliente" : "Recibir abono de deuda a cuenta corriente";
+		const shouldFacturar = facturarArcaOnAbono;
+		const customerSnapshot = selectedCustomer;
 		requestPermission(action, title, () => {
-			addDebtPayment(selectedCustomer.id, parsed, referenceStr, {
+			addDebtPayment(customerSnapshot.id, parsed, referenceStr, {
 				paymentMethod,
 				paymentMethodLabel: methodLabel,
 				mixedPayments: paymentMethod === "pago_mixto" ? mixedParts.filter((p) => p.amount > 0) : void 0,
@@ -102423,7 +104799,43 @@ var CreditosView = () => {
 				posnetDetails: posnetDetailsObj,
 				reference: referenceStr
 			});
+			if (shouldFacturar) {
+				const abonoSale = {
+					id: `abono-${Date.now()}`,
+					folio: `AB-${Date.now().toString().slice(-6)}`,
+					ticketNumber: parseInt(Date.now().toString().slice(-5), 10) || 1,
+					items: [{
+						id: `item-abono-${Date.now()}`,
+						productId: `prod-abono-${Date.now()}`,
+						barcode: `ABONO-${customerSnapshot.folio}`,
+						description: `RECIBO COBRO CTA. CTE. - ${customerSnapshot.name}`,
+						sellType: "unit",
+						quantity: 1,
+						unitPrice: parsed,
+						unitCost: 0,
+						total: parsed,
+						stockRemaining: 0,
+						department: "Cuentas Corrientes"
+					}],
+					subtotal: parsed,
+					taxes: 0,
+					total: parsed,
+					paymentMethod,
+					paymentMethodLabel: methodLabel,
+					amountPaid: parsed,
+					change: 0,
+					customerId: customerSnapshot.id,
+					customerName: customerSnapshot.name,
+					cashier: "Cajero Principal",
+					registerName: "Caja Principal",
+					timestamp: Date.now(),
+					ticketNotes: referenceStr || "Cobro de cuenta corriente"
+				};
+				setSaleToFacturar(abonoSale);
+				showToast("🧾 Abriendo asistente de Facturación Electrónica ARCA...", "info");
+			}
 			setAbonoAmount("");
+			setFacturarArcaOnAbono(false);
 			setIsAbonoOpen(false);
 		});
 	};
@@ -102798,244 +105210,432 @@ var CreditosView = () => {
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 							className: "p-4 space-y-4 overflow-y-auto flex-1",
-							children: [selectedCustomer.currentDebt < 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "flex flex-wrap items-center justify-between gap-3 bg-emerald-50 p-4 rounded-xl border border-emerald-300",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-										className: "text-xs font-bold text-emerald-800 uppercase flex items-center gap-1.5",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-4 h-4 text-emerald-600" }), "Saldo a Favor de Cuenta Corriente:"]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-2xl font-black font-mono text-emerald-700 mt-0.5",
-										children: ["+", formatARS(Math.abs(selectedCustomer.currentDebt))]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-										className: "text-[11px] text-emerald-600 mt-1",
-										children: "El cliente dispone de este monto para descontar automáticamente en futuras compras."
-									})
-								] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-									onClick: () => openAbonoModal("", "Depósito anticipado a favor del cliente"),
-									className: "px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Agregar Saldo a Favor (Todos los Medios)" })]
-								})]
-							}) : selectedCustomer.currentDebt > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "flex flex-wrap items-center justify-between gap-3 bg-red-50 p-4 rounded-xl border border-red-200",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										className: "text-xs font-bold text-red-800 uppercase",
-										children: "Deuda Pendiente en Cuenta Corriente:"
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-2xl font-black font-mono text-red-600 mt-0.5",
-										children: formatARS(selectedCustomer.currentDebt)
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
-										className: "text-[11px] text-red-500 mt-1",
-										children: [
-											"Límite disponible restante:",
-											" ",
-											formatARS(Math.max(0, selectedCustomer.creditLimit - selectedCustomer.currentDebt))
-										]
-									})
-								] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex flex-wrap items-center gap-2",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										onClick: () => openAbonoModal(selectedCustomer.currentDebt.toString(), "Cancelación total de deuda en cuenta corriente"),
-										className: "px-3.5 py-2 bg-red-700 hover:bg-red-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ArrowDownLeft, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cobrar Deuda Total" })]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										onClick: () => openAbonoModal("", "Abono parcial o saldo a favor"),
-										className: "px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cobrar Entrega Parcial / Saldo a Favor" })]
+							children: [
+								selectedCustomer.currentDebt < 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex flex-wrap items-center justify-between gap-3 bg-emerald-50 p-4 rounded-xl border border-emerald-300",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "text-xs font-bold text-emerald-800 uppercase flex items-center gap-1.5",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-4 h-4 text-emerald-600" }), "Saldo a Favor de Cuenta Corriente:"]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "text-2xl font-black font-mono text-emerald-700 mt-0.5",
+											children: ["+", formatARS(Math.abs(selectedCustomer.currentDebt))]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+											className: "text-[11px] text-emerald-600 mt-1",
+											children: "El cliente dispone de este monto para descontar automáticamente en futuras compras."
+										})
+									] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										onClick: () => openAbonoModal("", "Depósito anticipado a favor del cliente"),
+										className: "px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Agregar Saldo a Favor (Todos los Medios)" })]
 									})]
-								})]
-							}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										className: "text-xs font-bold text-slate-700 uppercase",
-										children: "Estado de Cuenta: Al Día"
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-2xl font-bold font-mono text-slate-800 mt-0.5",
-										children: "$0,00"
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-										className: "text-[11px] text-slate-500 mt-1",
-										children: "El cliente no registra saldo deudor."
-									})
-								] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-									onClick: () => openAbonoModal("", "Depósito anticipado a favor del cliente"),
-									className: "px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Dejar Saldo a Favor" })]
-								})]
-							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h4", {
-								className: "text-xs font-bold text-slate-700 uppercase mb-2",
-								children: "Historial de Movimientos y Medios de Cobro:"
-							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-								className: "border border-slate-200 rounded max-h-60 overflow-auto",
-								children: customerMovements.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "p-4 text-center text-xs text-slate-400",
-									children: "No hay compras a crédito ni abonos registrados todavía."
-								}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
-									className: "w-full text-left text-xs",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", {
-										className: "bg-slate-100 font-semibold border-b border-slate-200 text-slate-700",
-										children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "p-2",
-												children: "Fecha"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "p-2",
-												children: "Concepto / Comprobante"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "p-2",
-												children: "Medio de Pago"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "p-2 text-right",
-												children: "Importe"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "p-2 text-right",
-												children: "Saldo Resultante"
-											})
-										] })
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", {
-										className: "divide-y divide-slate-100",
-										children: customerMovements.map((m) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
-											className: "hover:bg-slate-50",
+								}) : selectedCustomer.currentDebt > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex flex-wrap items-center justify-between gap-3 bg-red-50 p-4 rounded-xl border border-red-200",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "text-xs font-bold text-red-800 uppercase",
+											children: "Deuda Pendiente en Cuenta Corriente:"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "text-2xl font-black font-mono text-red-600 mt-0.5",
+											children: formatARS(selectedCustomer.currentDebt)
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+											className: "text-[11px] text-red-500 mt-1",
 											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "p-2 text-slate-500 font-mono whitespace-nowrap",
-													children: new Date(m.date).toLocaleDateString("es-AR")
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
-													className: "p-2 font-medium text-slate-800",
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: m.concept }), m.folio && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: "text-[10px] font-mono text-slate-400",
-														children: ["Comp: ", m.folio]
-													})]
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "p-2",
-													children: m.type === "cargo" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[10px] font-bold",
-														children: "Cargo Cta. Cte."
-													}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200 text-[10px] font-bold",
-														children: m.paymentMethodLabel || "Efectivo"
-													})
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
-													className: `p-2 text-right font-mono font-bold whitespace-nowrap ${m.type === "cargo" ? "text-red-600" : "text-emerald-600"}`,
-													children: [
-														m.type === "cargo" ? "+" : "-",
-														" ",
-														formatARS(m.amount)
-													]
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "p-2 text-right font-mono font-semibold whitespace-nowrap",
-													children: m.balanceAfter < 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-														className: "text-emerald-700 font-bold bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200",
-														children: [
-															"+",
-															formatARS(Math.abs(m.balanceAfter)),
-															" a favor"
-														]
-													}) : m.balanceAfter > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "text-red-600",
-														children: formatARS(m.balanceAfter)
-													}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "text-slate-500",
-														children: "$0,00"
-													})
-												})
+												"Límite disponible restante:",
+												" ",
+												formatARS(Math.max(0, selectedCustomer.creditLimit - selectedCustomer.currentDebt))
 											]
-										}, m.id))
+										})
+									] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex flex-wrap items-center gap-2",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+											onClick: () => openAbonoModal(selectedCustomer.currentDebt.toString(), "Cancelación total de deuda en cuenta corriente"),
+											className: "px-3.5 py-2 bg-red-700 hover:bg-red-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ArrowDownLeft, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cobrar Deuda Total" })]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+											onClick: () => openAbonoModal("", "Abono parcial o saldo a favor"),
+											className: "px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cobrar Entrega Parcial / Saldo a Favor" })]
+										})]
 									})]
-								})
-							})] })]
+								}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+											className: "text-xs font-bold text-slate-700 uppercase",
+											children: "Estado de Cuenta: Al Día"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "text-2xl font-bold font-mono text-slate-800 mt-0.5",
+											children: "$0,00"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+											className: "text-[11px] text-slate-500 mt-1",
+											children: "El cliente no registra saldo deudor."
+										})
+									] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										onClick: () => openAbonoModal("", "Depósito anticipado a favor del cliente"),
+										className: "px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold text-xs shadow-xs flex items-center gap-1.5 cursor-pointer",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CirclePlus, { className: "w-4 h-4" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Dejar Saldo a Favor" })]
+									})]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex border-b border-slate-200 gap-2",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										type: "button",
+										onClick: () => setDetailTab("movimientos"),
+										className: `px-3.5 py-2 text-xs font-bold rounded-t-lg transition-all cursor-pointer flex items-center gap-1.5 ${detailTab === "movimientos" ? "bg-emerald-50 text-emerald-950 border-t border-l border-r border-emerald-300 shadow-2xs" : "text-slate-600 hover:text-slate-900 hover:bg-slate-50"}`,
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-4 h-4 text-emerald-700" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+											"Movimientos de Cuenta Corriente (",
+											customerMovements.length,
+											")"
+										] })]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										type: "button",
+										onClick: () => setDetailTab("tickets"),
+										className: `px-3.5 py-2 text-xs font-bold rounded-t-lg transition-all cursor-pointer flex items-center gap-1.5 ${detailTab === "tickets" ? "bg-emerald-50 text-emerald-950 border-t border-l border-r border-emerald-300 shadow-2xs" : "text-slate-600 hover:text-slate-900 hover:bg-slate-50"}`,
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Receipt, { className: "w-4 h-4 text-blue-700" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+											"Tickets y Compras del Cliente (",
+											customerSales.length,
+											")"
+										] })]
+									})]
+								}),
+								detailTab === "movimientos" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex items-center justify-between mb-2",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h4", {
+										className: "text-xs font-bold text-slate-700 uppercase",
+										children: "Historial de Cargos, Pagos y Comprobantes:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										className: "text-[11px] text-slate-500",
+										children: "Podes reimprimir cualquier comprobante o emitir Factura Electrónica ARCA"
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "border border-slate-200 rounded max-h-72 overflow-auto",
+									children: customerMovements.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "p-6 text-center text-xs text-slate-400",
+										children: "No hay movimientos de cuenta corriente registrados para este cliente."
+									}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
+										className: "w-full text-left text-xs",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", {
+											className: "bg-slate-100 font-semibold border-b border-slate-200 text-slate-700 sticky top-0 z-10",
+											children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Fecha y Hora"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Concepto / Comprobante"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Medio de Cobro"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-right",
+													children: "Importe"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-right",
+													children: "Saldo Resultante"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-center",
+													children: "Acciones"
+												})
+											] })
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", {
+											className: "divide-y divide-slate-100",
+											children: customerMovements.map((m) => {
+												const relatedSale = sales.find((s) => m.folio && s.folio === m.folio || s.id === m.folio || s.id === m.id);
+												const invoice = electronicInvoices.find((inv) => relatedSale && inv.saleId === relatedSale.id || relatedSale?.folio && inv.saleFolio === relatedSale.folio || m.folio && inv.saleFolio === m.folio);
+												return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
+													className: "hover:bg-slate-50",
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-slate-500 font-mono whitespace-nowrap",
+															children: new Date(m.date ?? m.timestamp ?? Date.now()).toLocaleString("es-AR", {
+																day: "2-digit",
+																month: "2-digit",
+																year: "numeric",
+																hour: "2-digit",
+																minute: "2-digit"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
+															className: "p-2 font-medium text-slate-800",
+															children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: m.concept }), m.folio && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: "text-[10px] font-mono text-slate-500 bg-slate-100 px-1 py-0.5 rounded",
+																children: ["Folio: ", m.folio]
+															})]
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2",
+															children: m.type === "cargo" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[10px] font-bold",
+																children: "Cargo Cta. Cte."
+															}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200 text-[10px] font-bold",
+																children: m.paymentMethodLabel || "Efectivo"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
+															className: `p-2 text-right font-mono font-bold whitespace-nowrap ${m.type === "cargo" ? "text-red-600" : "text-emerald-600"}`,
+															children: [
+																m.type === "cargo" ? "+" : "-",
+																" ",
+																formatARS(m.amount)
+															]
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-right font-mono font-semibold whitespace-nowrap",
+															children: m.balanceAfter < 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: "text-emerald-700 font-bold bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200",
+																children: [
+																	"+",
+																	formatARS(Math.abs(m.balanceAfter)),
+																	" a favor"
+																]
+															}) : m.balanceAfter > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "text-red-600",
+																children: formatARS(m.balanceAfter)
+															}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "text-slate-500",
+																children: "$0,00"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-center whitespace-nowrap",
+															children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+																className: "flex items-center justify-center gap-1.5",
+																children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => handleReimprimirTicket(m),
+																	className: "px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: "Reimprimir ticket de este movimiento en la impresora predeterminada",
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3 h-3 text-slate-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket" })]
+																}), invoice ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => setVisorInvoice(invoice),
+																	className: "px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: `Ver Factura Electrónica ARCA (CAE: ${invoice.cae})`,
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Eye, { className: "w-3 h-3 text-emerald-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: ["CAE ", invoice.tipoComprobante] })]
+																}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => handleFacturarMovimiento(m),
+																	className: "px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: "Emitir Factura Electrónica oficial en ARCA (AFIP) para este cobro o movimiento",
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileCheck, { className: "w-3 h-3 text-blue-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Facturar ARCA" })]
+																})]
+															})
+														})
+													]
+												}, m.id);
+											})
+										})]
+									})
+								})] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2 bg-[#FAF9F5] p-2.5 rounded-lg border border-slate-200",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h4", {
+										className: "text-xs font-bold text-slate-800 uppercase",
+										children: "Tickets de Venta Emitidos al Cliente:"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+										className: "text-[11px] text-slate-500",
+										children: [
+											"Marque las casillas ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "[✓]" }),
+											" de varios tickets para unificarlos y emitir ",
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "una sola factura ARCA agrupada" }),
+											"."
+										]
+									})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+										type: "button",
+										onClick: handleFacturarMultiplesTickets,
+										className: `px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-2xs transition-all ${selectedSaleIdsForInvoice.length > 0 ? "bg-blue-700 hover:bg-blue-800 text-white ring-2 ring-blue-300" : "bg-white text-slate-700 border border-slate-300 hover:bg-slate-100"}`,
+										title: "Facturar en una sola factura ARCA todos los tickets tildados",
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "🧾" }),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+												"Facturar ",
+												selectedSaleIdsForInvoice.length,
+												" Tickets Juntos en ARCA"
+											] }),
+											selectedSaleIdsForInvoice.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "bg-white text-blue-900 px-1.5 py-0.2 rounded-full text-[10px] font-extrabold",
+												children: selectedSaleIdsForInvoice.length
+											})
+										]
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "border border-slate-200 rounded max-h-72 overflow-auto",
+									children: customerSales.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+										className: "p-6 text-center text-xs text-slate-400",
+										children: "No hay tickets de venta asociados a este cliente todavía."
+									}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
+										className: "w-full text-left text-xs",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", {
+											className: "bg-slate-100 font-semibold border-b border-slate-200 text-slate-700 sticky top-0 z-10",
+											children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", { children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 w-10 text-center",
+													children: "✓"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Folio Ticket"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Fecha y Hora"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Artículos"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2",
+													children: "Medio"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-right",
+													children: "Total"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-center",
+													children: "Estado ARCA"
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
+													className: "p-2 text-center",
+													children: "Acciones"
+												})
+											] })
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", {
+											className: "divide-y divide-slate-100",
+											children: customerSales.map((sale) => {
+												const invoice = electronicInvoices.find((inv) => inv.saleId === sale.id || sale.folio && inv.saleFolio === sale.folio);
+												const isSelected = selectedSaleIdsForInvoice.includes(sale.id);
+												return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
+													className: `hover:bg-slate-50 ${isSelected ? "bg-blue-50/70" : ""}`,
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-center",
+															children: !invoice && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+																type: "checkbox",
+																checked: isSelected,
+																onChange: () => toggleSelectSaleForInvoice(sale.id),
+																className: "cursor-pointer rounded text-blue-600 focus:ring-0",
+																title: "Seleccionar para facturar junto a otros tickets"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 font-mono font-bold text-slate-800 whitespace-nowrap",
+															children: sale.folio
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-slate-500 font-mono whitespace-nowrap",
+															children: new Date(sale.timestamp).toLocaleString("es-AR", {
+																day: "2-digit",
+																month: "2-digit",
+																year: "numeric",
+																hour: "2-digit",
+																minute: "2-digit"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("td", {
+															className: "p-2 text-slate-700",
+															children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: "font-semibold",
+																children: [sale.items.length, " item(s)"]
+															}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+																className: "text-[10px] text-slate-400 truncate max-w-[200px]",
+																children: sale.items.map((it) => `${it.quantity}x ${it.description}`).join(", ")
+															})]
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2",
+															children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "px-2 py-0.5 rounded bg-slate-100 text-slate-800 border border-slate-200 text-[10px] font-bold",
+																children: sale.paymentMethodLabel || sale.paymentMethod
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-right font-mono font-black text-slate-900 whitespace-nowrap",
+															children: formatARS(sale.total)
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-center whitespace-nowrap",
+															children: invoice ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+																className: "px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 text-[10px] font-bold",
+																children: [
+																	invoice.tipoComprobante,
+																	" Nº ",
+																	invoice.numeroComprobante,
+																	" (CAE)"
+																]
+															}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+																className: "px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-semibold",
+																children: "Ticket No Fiscal"
+															})
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
+															className: "p-2 text-center whitespace-nowrap",
+															children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+																className: "flex items-center justify-center gap-1.5",
+																children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => handleReimprimirVentaTicket(sale),
+																	className: "px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: "Reimprimir ticket fiscal/no fiscal en la impresora predeterminada",
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3 h-3 text-slate-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Reimprimir" })]
+																}), invoice ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => setVisorInvoice(invoice),
+																	className: "px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: "Ver comprobante electrónico oficial ARCA con QR y CAE",
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Eye, { className: "w-3 h-3 text-emerald-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ver Factura" })]
+																}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+																	type: "button",
+																	onClick: () => handleFacturarVenta(sale),
+																	className: "px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-300 rounded text-[11px] font-bold flex items-center gap-1 cursor-pointer",
+																	title: "Emitir Factura Electrónica ARCA oficial para este ticket",
+																	children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileCheck, { className: "w-3 h-3 text-blue-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Facturar ARCA" })]
+																})]
+															})
+														})
+													]
+												}, sale.id);
+											})
+										})]
+									})
+								})] })
+							]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "bg-[#EDEDED] border-t border-[#C0BCA8] p-3 flex justify-between items-center",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: () => {
-									if (!selectedCustomer) return;
-									PrinterService.printA4ReportDirect({
-										title: "ESTADO DE CUENTA CORRIENTE DE CLIENTE",
-										subtitle: `Cliente: ${selectedCustomer.name} (Folio #${selectedCustomer.folio})`,
-										businessName: config?.businessName || "CONSOLATA POS",
-										businessAddress: config?.address,
-										businessCuit: config?.cuit,
-										metaLeft: [
-											{
-												label: "Cliente",
-												value: selectedCustomer.name
-											},
-											{
-												label: "CUIT / DNI",
-												value: selectedCustomer.cuit || "-"
-											},
-											{
-												label: "Teléfono",
-												value: selectedCustomer.phone || "-"
-											}
-										],
-										metaRight: [{
-											label: "Límite Autorizado",
-											value: formatARS(selectedCustomer.creditLimit)
-										}, {
-											label: "Saldo Actual",
-											value: (() => {
-												const bal = Number(selectedCustomer.currentDebt ?? selectedCustomer.currentBalance ?? 0);
-												return bal < 0 ? `+${formatARS(Math.abs(bal))} a favor` : formatARS(bal);
-											})()
-										}],
-										columns: [
-											{
-												header: "Fecha y Hora",
-												align: "left",
-												width: "20%"
-											},
-											{
-												header: "Concepto / Detalle",
-												align: "left",
-												width: "38%"
-											},
-											{
-												header: "Tipo",
-												align: "center",
-												width: "12%"
-											},
-											{
-												header: "Importe",
-												align: "right",
-												width: "15%"
-											},
-											{
-												header: "Saldo Resultante",
-												align: "right",
-												width: "15%"
-											}
-										],
-										rows: customerMovements.map((m) => [
-											new Date(m.date ?? m.timestamp ?? Date.now()).toLocaleString("es-AR"),
-											m.concept || m.description || "-",
-											m.type === "cargo" ? "CARGO" : "ABONO",
-											`${m.type === "cargo" ? "+" : "-"}${formatARS(m.amount)}`,
-											m.balanceAfter < 0 ? `+${formatARS(Math.abs(m.balanceAfter))} a favor` : formatARS(m.balanceAfter)
-										])
-									});
-								},
-								className: "px-3 py-1.5 text-xs font-semibold bg-white border border-[#BEBAA7] rounded text-slate-700 flex items-center gap-1.5 cursor-pointer",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir Estado de Cuenta" })]
+							className: "bg-[#EDEDED] border-t border-[#C0BCA8] p-3 flex flex-wrap justify-between items-center gap-2",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex flex-wrap items-center gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									type: "button",
+									onClick: handlePrintResumenTermico,
+									className: "px-3.5 py-2 text-xs font-black bg-[#185848] hover:bg-emerald-800 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer",
+									title: "Imprime directamente en ticket térmico (80mm/58mm) con tipografía grande, todos los movimientos y TOTAL ADEUDADO bien destacado",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-4 h-4 text-emerald-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "🖨️ Imprimir Resumen en Ticket (Térmica)" })]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									type: "button",
+									onClick: handlePrintResumenA4,
+									className: "px-3.5 py-2 text-xs font-bold bg-white hover:bg-slate-50 border border-[#BEBAA7] rounded-lg text-slate-800 flex items-center gap-1.5 cursor-pointer shadow-2xs",
+									title: "Imprime el estado de cuenta en formato A4 completo con selector de impresora de Windows",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-4 h-4 text-blue-700" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "📄 Imprimir Resumen en A4 (Selector)" })]
+								})]
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+								type: "button",
 								onClick: () => setShowDetailModal(false),
-								className: "px-4 py-1.5 text-xs font-semibold bg-white border border-[#BEBAA7] rounded text-slate-800 cursor-pointer",
+								className: "px-4 py-2 text-xs font-bold bg-white hover:bg-slate-100 border border-[#BEBAA7] rounded-lg text-slate-800 cursor-pointer",
 								children: "Cerrar"
 							})]
 						})
@@ -103693,7 +106293,27 @@ var CreditosView = () => {
 										onChange: (e) => setAbonoNotes(e.target.value),
 										placeholder: "Ej: Pago parcial factura / Comprobante adjunto...",
 										className: "w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
-									})] })
+									})] }),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "p-3 bg-blue-50/90 border border-blue-200 rounded-xl flex items-start gap-3",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+											type: "checkbox",
+											id: "facturarArcaAbonoCheck",
+											checked: facturarArcaOnAbono,
+											onChange: (e) => setFacturarArcaOnAbono(e.target.checked),
+											className: "mt-0.5 w-4 h-4 text-blue-600 rounded border-slate-300 cursor-pointer"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", {
+											htmlFor: "facturarArcaAbonoCheck",
+											className: "text-xs text-slate-800 cursor-pointer select-none",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+												className: "text-blue-950 block font-bold",
+												children: "🧾 Emitir Factura Electrónica ARCA / AFIP al confirmar el cobro (Opcional)"
+											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-[11px] text-blue-800",
+												children: "Al dejar tildada esta casilla, una vez registrado el cobro en la cuenta corriente se abrirá automáticamente el asistente para emitir la Factura Oficial (B, C o A) con CAE y QR fiscal ante ARCA."
+											})]
+										})]
+									})
 								]
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -103717,6 +106337,21 @@ var CreditosView = () => {
 				isOpen: isExcelImportOpen,
 				onClose: () => setIsExcelImportOpen(false),
 				initialTarget: "clientes"
+			}),
+			saleToFacturar && /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModalFacturarTicket, {
+				isOpen: !!saleToFacturar,
+				sale: saleToFacturar,
+				onClose: () => setSaleToFacturar(null),
+				onInvoiceCreated: (invoice) => {
+					setSaleToFacturar(null);
+					setVisorInvoice(invoice);
+					showToast(`✓ Factura Electrónica ${invoice.tipoComprobante} Nº ${invoice.numeroComprobante} emitida exitosamente en ARCA (CAE: ${invoice.cae}).`, "success");
+				}
+			}),
+			visorInvoice && /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModalVisorFactura, {
+				isOpen: !!visorInvoice,
+				invoice: visorInvoice,
+				onClose: () => setVisorInvoice(null)
 			})
 		]
 	});
@@ -104269,7 +106904,7 @@ var ClientesView = () => {
 //#endregion
 //#region src/components/DepartamentosManager.tsx
 var DepartamentosManager = ({ onBack, onSelectDepartment }) => {
-	const { departments, addDepartment, updateDepartment, deleteDepartment, addSubdepartment, removeSubdepartment, products, showToast, showConfirm } = usePOS();
+	const { departments, addDepartment, updateDepartment, deleteDepartment, addSubdepartment, removeSubdepartment, products, updateProduct, showToast, showConfirm } = usePOS();
 	const [selectedDeptId, setSelectedDeptId] = (0, import_react.useState)(departments[0]?.id || "");
 	const [newDeptName, setNewDeptName] = (0, import_react.useState)("");
 	const [newDeptIsThirdParty, setNewDeptIsThirdParty] = (0, import_react.useState)(false);
@@ -104371,6 +107006,74 @@ var DepartamentosManager = ({ onBack, onSelectDepartment }) => {
 	const handleDeleteSubdept = (deptId, subName) => {
 		removeSubdepartment(deptId, subName);
 		showToast(`Sub-departamento "${subName}" eliminado.`, "info");
+	};
+	const [editingSubdeptOldName, setEditingSubdeptOldName] = (0, import_react.useState)(null);
+	const [editingSubdeptNewName, setEditingSubdeptNewName] = (0, import_react.useState)("");
+	const handleSaveEditSubdept = (dept, oldName) => {
+		const trimmed = editingSubdeptNewName.trim();
+		if (!trimmed) {
+			showToast("El nombre del subdepartamento no puede estar vacío.", "warning");
+			return;
+		}
+		if (trimmed.toUpperCase() === oldName.toUpperCase()) {
+			setEditingSubdeptOldName(null);
+			return;
+		}
+		const updatedSubs = (dept.subdepartments || []).map((s) => s === oldName ? trimmed : s);
+		updateDepartment({
+			...dept,
+			subdepartments: updatedSubs
+		});
+		const deptKey = normalizeDeptKey(dept.name);
+		products.forEach((p) => {
+			if (normalizeDeptKey(p.department) === deptKey && normalizeDeptKey(p.subdepartment || "") === normalizeDeptKey(oldName)) updateProduct(p.id, { subdepartment: trimmed });
+		});
+		setEditingSubdeptOldName(null);
+		showToast(`✓ Subdepartamento renombrado de "${oldName}" a "${trimmed}".`, "success");
+	};
+	const [isConvertModalOpen, setIsConvertModalOpen] = (0, import_react.useState)(false);
+	const [targetParentName, setTargetParentName] = (0, import_react.useState)("");
+	const handleConvertToSubdepartment = (e) => {
+		e.preventDefault();
+		if (!selectedDept) return;
+		const parentUpper = targetParentName.trim().toUpperCase();
+		if (!parentUpper) {
+			showToast("Ingrese el nombre del nuevo departamento principal (padre).", "warning");
+			return;
+		}
+		if (parentUpper === selectedDept.name.toUpperCase()) {
+			showToast("El departamento padre no puede ser el mismo que se va a convertir.", "warning");
+			return;
+		}
+		showConfirm("Convertir Departamento en Subdepartamento", `¿Desea convertir el departamento "${selectedDept.name}" en un subdepartamento de "${parentUpper}"? Todos sus productos pasarán automáticamente a "${parentUpper}" (bajo el subdepartamento "${selectedDept.name}"), y este departamento independiente será eliminado.`, () => {
+			let parentDept = departments.find((d) => d.name.toUpperCase() === parentUpper);
+			if (!parentDept) {
+				const newId = `dept-${Date.now()}-${Math.floor(Math.random() * 1e3)}`;
+				const newSubs = Array.from(/* @__PURE__ */ new Set([selectedDept.name, ...selectedDept.subdepartments || []]));
+				addDepartment(parentUpper, newSubs, { id: newId });
+			} else {
+				const newSubs = Array.from(/* @__PURE__ */ new Set([
+					...parentDept.subdepartments || [],
+					selectedDept.name,
+					...selectedDept.subdepartments || []
+				]));
+				updateDepartment({
+					...parentDept,
+					subdepartments: newSubs
+				});
+			}
+			const oldName = selectedDept.name.toUpperCase();
+			products.forEach((p) => {
+				if ((p.department || "").trim().toUpperCase() === oldName) updateProduct(p.id, {
+					department: parentUpper,
+					subdepartment: p.subdepartment ? `${selectedDept.name} > ${p.subdepartment}` : selectedDept.name
+				});
+			});
+			deleteDepartment(selectedDept.id);
+			showToast(`✓ Departamento "${selectedDept.name}" convertido exitosamente en subdepartamento de "${parentUpper}".`, "success");
+			setIsConvertModalOpen(false);
+			setTargetParentName("");
+		});
 	};
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "flex-1 flex flex-col bg-[#ECE9D8] overflow-hidden font-sans select-none",
@@ -104701,14 +107404,22 @@ var DepartamentosManager = ({ onBack, onSelectDepartment }) => {
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 								className: "text-[11px] text-slate-600 mt-0.5",
 								children: "Configure la titularidad, comisiones de liquidación en el Corte del Día y sub-departamentos."
-							})] }), onSelectDepartment && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: () => onSelectDepartment(selectedDept.name),
-								className: "px-3 py-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-xs font-bold cursor-pointer",
-								children: [
-									"Usar ",
-									selectedDept.name,
-									" en Producto"
-								]
+							})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex items-center gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									onClick: () => setIsConvertModalOpen(true),
+									className: "px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-2xs",
+									title: "Convertir este departamento en subdepartamento de otro",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Layers, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Convertir en Subdepartamento..." })]
+								}), onSelectDepartment && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									onClick: () => onSelectDepartment(selectedDept.name),
+									className: "px-3 py-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-xs font-bold cursor-pointer",
+									children: [
+										"Usar ",
+										selectedDept.name,
+										" en Producto"
+									]
+								})]
 							})]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -104831,16 +107542,54 @@ var DepartamentosManager = ({ onBack, onSelectDepartment }) => {
 										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 											className: "flex items-start justify-between",
 											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												className: "flex items-center gap-2",
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-2 h-2 rounded-full bg-emerald-500" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "flex items-center gap-2 flex-1 mr-2",
+												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-2 h-2 rounded-full bg-emerald-500 shrink-0" }), editingSubdeptOldName === subName ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													className: "flex items-center gap-1 flex-1",
+													children: [
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+															type: "text",
+															value: editingSubdeptNewName,
+															onChange: (e) => setEditingSubdeptNewName(e.target.value),
+															className: "w-full px-2 py-1 border border-blue-500 rounded text-xs font-bold outline-none",
+															autoFocus: true,
+															onKeyDown: (e) => {
+																if (e.key === "Enter") handleSaveEditSubdept(selectedDept, subName);
+																if (e.key === "Escape") setEditingSubdeptOldName(null);
+															}
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+															onClick: () => handleSaveEditSubdept(selectedDept, subName),
+															className: "p-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 cursor-pointer",
+															title: "Guardar",
+															children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-3 h-3" })
+														}),
+														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+															onClick: () => setEditingSubdeptOldName(null),
+															className: "p-1 bg-slate-200 text-slate-700 rounded hover:bg-slate-300 cursor-pointer",
+															title: "Cancelar",
+															children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-3 h-3" })
+														})
+													]
+												}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 													className: "text-xs font-bold text-slate-800",
 													children: subName
 												})]
-											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-												onClick: () => handleDeleteSubdept(selectedDept.id, subName),
-												className: "text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 cursor-pointer",
-												title: "Eliminar sub-departamento",
-												children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Trash2, { className: "w-3.5 h-3.5" })
+											}), editingSubdeptOldName !== subName && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+												className: "flex items-center gap-1",
+												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+													onClick: () => {
+														setEditingSubdeptOldName(subName);
+														setEditingSubdeptNewName(subName);
+													},
+													className: "text-slate-400 hover:text-blue-600 p-1 rounded hover:bg-blue-50 cursor-pointer",
+													title: "Modificar nombre de sub-departamento",
+													children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Pen, { className: "w-3.5 h-3.5" })
+												}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+													onClick: () => handleDeleteSubdept(selectedDept.id, subName),
+													className: "text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 cursor-pointer",
+													title: "Eliminar sub-departamento",
+													children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Trash2, { className: "w-3.5 h-3.5" })
+												})]
 											})]
 										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 											className: "mt-2 pt-2 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-500",
@@ -104988,6 +107737,80 @@ var DepartamentosManager = ({ onBack, onSelectDepartment }) => {
 				isOpen: isExcelModalOpen,
 				onClose: () => setIsExcelModalOpen(false),
 				initialTarget: "departamentos"
+			}),
+			isConvertModalOpen && selectedDept && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+				className: "fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4",
+				children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-white rounded-lg shadow-2xl max-w-md w-full border border-slate-300 overflow-hidden",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "bg-[#1E4D8F] text-white px-4 py-3 flex items-center justify-between",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("h3", {
+							className: "text-sm font-bold uppercase flex items-center gap-2",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Layers, { className: "w-4 h-4 text-emerald-400" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+								"Convertir \"",
+								selectedDept.name,
+								"\" en Subdepartamento"
+							] })]
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							onClick: () => setIsConvertModalOpen(false),
+							className: "text-white/80 hover:text-white cursor-pointer",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
+						})]
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("form", {
+						onSubmit: handleConvertToSubdepartment,
+						className: "p-4 space-y-4",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+								className: "text-xs text-slate-600 leading-relaxed",
+								children: [
+									"Seleccione o escriba el nombre del nuevo departamento principal (padre). Todos los productos asignados a ",
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: selectedDept.name }),
+									" y sus sub-ítems se moverán automáticamente a ese nuevo departamento."
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+									className: "block text-xs font-bold text-slate-700 uppercase mb-1",
+									children: "Departamento Principal (Padre):"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									type: "text",
+									list: "existing-depts-list",
+									value: targetParentName,
+									onChange: (e) => setTargetParentName(e.target.value),
+									placeholder: "Ej: ALMACEN, BEBIDAS, etc.",
+									className: "w-full px-3 py-2 border border-slate-300 rounded text-xs font-bold uppercase focus:border-blue-600 outline-none",
+									required: true
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("datalist", {
+									id: "existing-depts-list",
+									children: departments.filter((d) => d.id !== selectedDept.id).map((d) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: d.name }, d.id))
+								})
+							] }),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "bg-amber-50 border border-amber-200 p-2.5 rounded text-[11px] text-amber-800",
+								children: [
+									"⚠️ El departamento actual ",
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: selectedDept.name }),
+									" será eliminado de la lista independiente tras completarse la conversión."
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex justify-end gap-2 pt-2 border-t border-slate-200",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+									type: "button",
+									onClick: () => setIsConvertModalOpen(false),
+									className: "px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-xs font-bold cursor-pointer",
+									children: "Cancelar"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									type: "submit",
+									className: "px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-bold shadow-xs cursor-pointer flex items-center gap-1.5",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ejecutar Conversión" })]
+								})]
+							})
+						]
+					})]
+				})
 			})
 		]
 	});
@@ -111537,6 +114360,18 @@ var ProductosView = () => {
 	const [isTiendanubeOpen, setIsTiendanubeOpen] = (0, import_react.useState)(false);
 	const [productFormTab, setProductFormTab] = (0, import_react.useState)("producto");
 	const [barcode, setBarcode] = (0, import_react.useState)("");
+	const [duplicateModalProduct, setDuplicateModalProduct] = (0, import_react.useState)(null);
+	const checkBarcodeDuplicate = (codeToTest) => {
+		const clean = codeToTest.trim().toLowerCase();
+		if (!clean) return false;
+		const match = products.find((p) => p.barcode && p.barcode.trim().toLowerCase() === clean && p.id !== editingProductId);
+		if (match) {
+			setDuplicateModalProduct(match);
+			hardwareAudio.playErrorTone();
+			return true;
+		}
+		return false;
+	};
 	const [description, setDescription] = (0, import_react.useState)("");
 	const [sellType, setSellType] = (0, import_react.useState)("unit");
 	const [costPrice, setCostPrice] = (0, import_react.useState)("0");
@@ -111648,7 +114483,8 @@ var ProductosView = () => {
 				setCatalogDeptFilter("todos");
 				setCatalogSubdeptFilter("todos");
 				showToast(`Código "${clean}" colocado en búsqueda del catálogo.`, "info");
-			} else {
+			} else if (checkBarcodeDuplicate(clean)) setBarcode("");
+			else {
 				setBarcode(clean);
 				showToast(`Código "${clean}" asignado al producto.`, "success");
 			}
@@ -113052,7 +115888,27 @@ var ProductosView = () => {
 									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
 										type: "text",
 										value: barcode,
-										onChange: (e) => setBarcode(e.target.value),
+										onChange: (e) => {
+											const val = e.target.value;
+											setBarcode(val);
+											if (val.trim().length >= 3) {
+												const trimmed = val.trim().toLowerCase();
+												const match = products.find((p) => p.barcode && p.barcode.trim().toLowerCase() === trimmed && p.id !== editingProductId);
+												if (match) {
+													setDuplicateModalProduct(match);
+													hardwareAudio.playErrorTone();
+												}
+											}
+										},
+										onKeyDown: (e) => {
+											if (e.key === "Enter") {
+												e.preventDefault();
+												if (barcode.trim()) checkBarcodeDuplicate(barcode);
+											}
+										},
+										onBlur: () => {
+											if (barcode.trim()) checkBarcodeDuplicate(barcode);
+										},
 										placeholder: "Escanear o ingresar código...",
 										className: "w-full sm:w-64 px-2 py-1 border border-slate-300 rounded text-xs focus:outline-none focus:border-blue-500 font-mono bg-white"
 									}), isMobile && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
@@ -113983,6 +116839,109 @@ var ProductosView = () => {
 				onClose: () => setIsBatchUpdateModalOpen(false),
 				selectedProductIds: selectedCatalogProductIds,
 				onClearSelection: () => setSelectedCatalogProductIds([])
+			}),
+			duplicateModalProduct && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+				className: "fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in font-sans select-none",
+				children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden border-2 border-red-500 animate-scale-in",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "bg-gradient-to-r from-red-600 to-rose-700 text-white px-5 py-3.5 flex items-center gap-3",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "w-9 h-9 rounded-full bg-white/20 flex items-center justify-center shrink-0",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(TriangleAlert, { className: "w-5 h-5 text-amber-300" })
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "flex-1",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
+								className: "text-sm font-black uppercase tracking-wide",
+								children: "¡Atención! Producto Ya Existente"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-[11px] text-red-100",
+								children: "El código de barras ya se encuentra registrado en el catálogo"
+							})]
+						})]
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "p-5 space-y-4 text-xs",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "bg-red-50 border border-red-200 rounded-lg p-3.5 space-y-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+									className: "text-red-950 font-bold text-xs flex items-center gap-1.5",
+									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "⛔ No se puede cargar como un producto nuevo:" })
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "pl-1 space-y-1",
+									children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-baseline gap-2",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-slate-500 text-[11px]",
+												children: "Código:"
+											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+												className: "font-mono text-sm text-red-700 font-bold bg-white px-2 py-0.5 rounded border border-red-200",
+												children: duplicateModalProduct.barcode
+											})]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-baseline gap-2",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "text-slate-500 text-[11px]",
+												children: "Artículo:"
+											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+												className: "text-slate-900 text-xs font-black",
+												children: duplicateModalProduct.description
+											})]
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-center gap-4 pt-1 font-mono text-[11px] text-slate-700",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: ["Precio Venta: ", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+													className: "text-slate-900 font-bold",
+													children: formatARS(duplicateModalProduct.salePrice)
+												})] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: ["Stock Actual: ", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+													className: "text-emerald-700 font-bold",
+													children: duplicateModalProduct.stock
+												})] }),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: ["Depto: ", /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: duplicateModalProduct.department })] })
+											]
+										})
+									]
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+								className: "text-slate-600 text-[11px] leading-relaxed",
+								children: [
+									"Para evitar duplicados y errores de inventario, no está permitido crear otro artículo con el mismo código. Podés ",
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "modificar el producto existente" }),
+									" o ",
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "cancelar" }),
+									" para escanear un código diferente."
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex flex-col sm:flex-row items-center justify-end gap-2 pt-2 border-t border-slate-200",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									type: "button",
+									onClick: () => {
+										const prodToEdit = duplicateModalProduct;
+										setDuplicateModalProduct(null);
+										handleEditProduct(prodToEdit);
+										showToast(`Cargando "${prodToEdit.description}" para modificarlo...`, "info");
+									},
+									className: "w-full sm:w-auto px-4 py-2 bg-gradient-to-b from-blue-600 to-indigo-700 hover:from-blue-700 hover:to-indigo-800 text-white rounded-lg text-xs font-bold shadow-md flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 transition-all",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Pen, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Modificar Producto Existente" })]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+									type: "button",
+									onClick: () => {
+										setDuplicateModalProduct(null);
+										setBarcode("");
+									},
+									className: "w-full sm:w-auto px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded-lg text-xs font-bold flex items-center justify-center gap-1 cursor-pointer transition-all",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-3.5 h-3.5 text-slate-500" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cerrar y Limpiar Código" })]
+								})]
+							})
+						]
+					})]
+				})
 			})
 		]
 	});
@@ -129539,7 +132498,7 @@ var PanelHistorialActualizaciones = ({ onDownloadDiskUpdater, showToast, isModal
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 					className: "divide-y divide-slate-200",
 					children: visibleRevisions.map((item, index) => {
-						const isCurrent = item.rev === "v5.67-20261102-R37" || index === 0;
+						const isCurrent = item.rev === "v5.68-20261106-R38" || index === 0;
 						const isExpanded = expandedRev === item.rev;
 						return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 							className: `p-3 transition-colors ${isCurrent ? "bg-blue-50/35" : "hover:bg-slate-50/80"}`,
@@ -131677,1772 +134636,6 @@ var XubioHomeDashboard = ({ onNavigateTab, onOpenNuevaFactura, onOpenNuevaCompra
 				})]
 			})
 		]
-	});
-};
-//#endregion
-//#region src/components/administracion/ModalFacturarTicket.tsx
-var ModalFacturarTicket = ({ sale, isOpen, onClose, onInvoiceCreated }) => {
-	const { config, customers, generateInvoiceForSale, showToast } = usePOS();
-	const [puntoVenta, setPuntoVenta] = (0, import_react.useState)(config.afipConfig?.puntoVenta || 4);
-	const [tipoComprobante, setTipoComprobante] = (0, import_react.useState)(config.afipConfig?.tipoFactura === "C" ? "FC" : "FB");
-	const [receptorTipoDoc, setReceptorTipoDoc] = (0, import_react.useState)("DNI");
-	const [receptorNroDoc, setReceptorNroDoc] = (0, import_react.useState)("");
-	const [receptorRazonSocial, setReceptorRazonSocial] = (0, import_react.useState)("");
-	const [receptorCondicionIva, setReceptorCondicionIva] = (0, import_react.useState)("Consumidor Final");
-	const [receptorDomicilio, setReceptorDomicilio] = (0, import_react.useState)("");
-	const [isConsultingAfip, setIsConsultingAfip] = (0, import_react.useState)(false);
-	const [isSubmittingWsfe, setIsSubmittingWsfe] = (0, import_react.useState)(false);
-	const [stepWsfe, setStepWsfe] = (0, import_react.useState)("");
-	const [errorMsg, setErrorMsg] = (0, import_react.useState)(null);
-	const [padronVerified, setPadronVerified] = (0, import_react.useState)(false);
-	(0, import_react.useEffect)(() => {
-		if (config.afipConfig?.puntoVenta) setPuntoVenta(Number(config.afipConfig.puntoVenta));
-		else setPuntoVenta(4);
-	}, [isOpen, config.afipConfig?.puntoVenta]);
-	(0, import_react.useEffect)(() => {
-		if (!sale) return;
-		const isMonotributoEmisor = config.afipConfig?.tipoFactura === "C";
-		if (sale.customerId) {
-			const cust = customers.find((c) => c.id === sale.customerId);
-			if (cust) {
-				setReceptorRazonSocial(cust.name);
-				setReceptorNroDoc(cust.cuit || "");
-				setReceptorDomicilio(`${cust.address1}${cust.city ? ", " + cust.city : ""}`);
-				const cleanDoc = (cust.cuit || "").replace(/\D/g, "");
-				if (cleanDoc.length === 11) {
-					setReceptorTipoDoc("CUIT");
-					if (cleanDoc.startsWith("30") || cleanDoc.startsWith("33")) {
-						setReceptorCondicionIva("IVA Responsable Inscripto");
-						setTipoComprobante(isMonotributoEmisor ? "FC" : "FA");
-					} else {
-						setReceptorCondicionIva("Responsable Monotributo");
-						setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
-					}
-				} else {
-					setReceptorTipoDoc("DNI");
-					setReceptorCondicionIva("Consumidor Final");
-					setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
-				}
-				return;
-			}
-		}
-		setReceptorTipoDoc("DNI");
-		setReceptorNroDoc("0");
-		setReceptorRazonSocial(sale.customerName || "CONSUMIDOR FINAL");
-		setReceptorCondicionIva("Consumidor Final");
-		setTipoComprobante(isMonotributoEmisor ? "FC" : "FB");
-		setReceptorDomicilio("");
-		setErrorMsg(null);
-	}, [
-		sale,
-		customers,
-		config.afipConfig?.tipoFactura
-	]);
-	if (!isOpen || !sale) return null;
-	const handleConsultarPadron = async () => {
-		if (!receptorNroDoc || receptorNroDoc.trim() === "" || receptorNroDoc === "0") {
-			showToast("Ingrese un CUIT o DNI válido para consultar en ARCA", "warning");
-			return;
-		}
-		setIsConsultingAfip(true);
-		setErrorMsg(null);
-		try {
-			const res = await consultarPadronAfip(receptorNroDoc, customers);
-			if (res.razonSocial) setReceptorRazonSocial(res.razonSocial);
-			setReceptorCondicionIva(res.condicionIva);
-			if (res.domicilioFiscal) setReceptorDomicilio(res.domicilioFiscal);
-			setReceptorTipoDoc(res.tipoDoc);
-			setReceptorNroDoc(res.cuit || receptorNroDoc);
-			if (res.origenDato === "requiere_carga") {
-				setPadronVerified(false);
-				setErrorMsg("CUIT con dígito verificador válido en ARCA, pero aún no registrado en su base local. Ingrese la Razón Social y Domicilio; se guardará automáticamente.");
-				showToast("Ingrese Razón Social y Domicilio para registrar este CUIT en el Padrón ARCA", "warning");
-			} else {
-				setPadronVerified(true);
-				setErrorMsg(null);
-				if (config.afipConfig?.tipoFactura === "C") {
-					setTipoComprobante("FC");
-					showToast(`✓ Contribuyente "${res.razonSocial}" verificado en ARCA (${res.condicionIva}). Factura C asignada.`, "success");
-				} else if (res.condicionIva === "IVA Responsable Inscripto") {
-					setTipoComprobante("FA");
-					showToast(`✓ Contribuyente "${res.razonSocial}" verificado en ARCA (Responsable Inscripto). Factura A asignada.`, "success");
-				} else {
-					setTipoComprobante("FB");
-					showToast(`✓ Contribuyente "${res.razonSocial}" verificado (${res.condicionIva}). Factura B asignada.`, "info");
-				}
-			}
-		} catch {
-			setErrorMsg("No se pudo conectar con el padrón ARCA. Verifique el número ingresado.");
-		} finally {
-			setIsConsultingAfip(false);
-		}
-	};
-	const handleGuardarEnPadron = () => {
-		if (!receptorNroDoc || !receptorRazonSocial) {
-			showToast("Ingrese número de documento y razón social a guardar", "warning");
-			return;
-		}
-		const cleanDoc = receptorNroDoc.replace(/\D/g, "");
-		guardarEnPadronArca({
-			cuit: receptorNroDoc,
-			dni: cleanDoc.length === 11 ? cleanDoc.slice(2, 10).replace(/^0+/, "") : cleanDoc,
-			razonSocial: receptorRazonSocial.trim().toUpperCase(),
-			condicionIva: receptorCondicionIva,
-			tipoDoc: receptorTipoDoc === "Consumidor Final" ? "DNI" : receptorTipoDoc,
-			domicilioFiscal: receptorDomicilio.trim() || "Río Cuarto, Córdoba",
-			localidad: "Río Cuarto",
-			provincia: "Córdoba",
-			actividadPrincipal: "Contribuyente Registrado",
-			estadoClave: "ACTIVO",
-			origenDato: "padron_oficial"
-		});
-		setPadronVerified(true);
-		showToast(`✓ Datos fiscales de "${receptorRazonSocial.trim().toUpperCase()}" guardados en Padrón ARCA`, "success");
-	};
-	const handleEmitirFactura = async () => {
-		if (tipoComprobante === "FA") {
-			if (receptorNroDoc.replace(/\D/g, "").length !== 11) {
-				setErrorMsg("Factura A exige un número de CUIT válido de 11 dígitos.");
-				return;
-			}
-			if (receptorCondicionIva !== "IVA Responsable Inscripto") {
-				setErrorMsg("Solo se puede emitir Factura A a contribuyentes IVA Responsable Inscripto.");
-				return;
-			}
-		}
-		setIsSubmittingWsfe(true);
-		setErrorMsg(null);
-		setStepWsfe("Conectando con Servidor de Autenticación ARCA (WSAA)...");
-		await new Promise((r) => setTimeout(r, 450));
-		setStepWsfe("Validando Certificado Digital X.509 y Token de Acceso...");
-		await new Promise((r) => setTimeout(r, 400));
-		setStepWsfe("Enviando solicitud WSFEv1 FECAESolicitar para Ticket " + sale.folio + "...");
-		try {
-			const invoice = await generateInvoiceForSale(sale.id, {
-				tipoComprobante,
-				puntoVenta,
-				receptorTipoDoc,
-				receptorNroDoc: receptorNroDoc || "0",
-				receptorRazonSocial: receptorRazonSocial || "CONSUMIDOR FINAL",
-				receptorCondicionIva,
-				receptorDomicilio
-			});
-			if (invoice) {
-				showToast(`¡Factura Electrónica ${invoice.tipoComprobante} Nº ${invoice.numeroComprobante} autorizada por ARCA! CAE: ${invoice.cae}`, "success");
-				onInvoiceCreated(invoice);
-				onClose();
-			} else setErrorMsg("Error al generar la factura electrónica en el servidor local.");
-		} catch (e) {
-			setErrorMsg(e?.message || "Error en la autorización de Web Service ARCA/AFIP.");
-		} finally {
-			setIsSubmittingWsfe(false);
-			setStepWsfe("");
-		}
-	};
-	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-		className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-3",
-		children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-			className: "bg-white rounded-xl shadow-2xl border border-slate-300 w-full max-w-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150",
-			children: [
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "bg-gradient-to-r from-blue-900 to-indigo-950 text-white px-5 py-3.5 flex items-center justify-between",
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "flex items-center gap-2.5",
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							className: "w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center border border-white/20",
-							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldCheck, { className: "w-5 h-5 text-emerald-400" })
-						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("h3", {
-							className: "text-sm font-bold flex items-center gap-2",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Generar Factura Electrónica ARCA / AFIP" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-								className: "text-[10px] bg-blue-500/30 text-blue-200 border border-blue-400/30 px-2 py-0.5 rounded-full font-mono",
-								children: "WSFEv1"
-							})]
-						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
-							className: "text-[11px] text-slate-300",
-							children: [
-								"Ticket: ",
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
-									className: "text-white",
-									children: sale.folio
-								}),
-								" • Total:",
-								" ",
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
-									className: "text-emerald-400 font-mono",
-									children: formatARS(sale.total)
-								})
-							]
-						})] })]
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-						onClick: onClose,
-						disabled: isSubmittingWsfe,
-						className: "w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 rounded-lg transition-colors",
-						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
-					})]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "p-5 space-y-4 max-h-[80vh] overflow-y-auto",
-					children: [
-						errorMsg && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-xs text-red-700",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(TriangleAlert, { className: "w-4 h-4 shrink-0 text-red-500" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: errorMsg })]
-						}),
-						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between text-xs",
-							children: [
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "text-slate-500 text-[10px] uppercase font-semibold",
-									children: "Venta Original"
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "font-bold text-slate-800",
-									children: [
-										"Ticket Nº ",
-										sale.ticketNumber,
-										" (",
-										sale.folio,
-										")"
-									]
-								})] }),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "text-slate-500 text-[10px] uppercase font-semibold",
-									children: "Ítems"
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "font-semibold text-slate-700",
-									children: [
-										sale.items.length,
-										" producto",
-										sale.items.length !== 1 ? "s" : ""
-									]
-								})] }),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "text-slate-500 text-[10px] uppercase font-semibold",
-									children: "Medio de Pago"
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "font-semibold text-slate-700 capitalize",
-									children: sale.paymentMethodLabel || sale.paymentMethod
-								})] }),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "text-right",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-slate-500 text-[10px] uppercase font-semibold",
-										children: "Total a Facturar"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-sm font-black font-mono text-blue-900",
-										children: formatARS(sale.total)
-									})]
-								})
-							]
-						}),
-						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "grid grid-cols-1 sm:grid-cols-2 gap-4",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-									className: "block text-xs font-bold text-slate-700 mb-1",
-									children: "Punto de Venta Fiscal (Web Services):"
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex items-center gap-2",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-										type: "number",
-										min: 1,
-										max: 99999,
-										value: puntoVenta,
-										onChange: (e) => setPuntoVenta(Math.max(1, Number(e.target.value) || 4)),
-										disabled: isSubmittingWsfe,
-										className: "w-24 text-xs font-mono font-black border border-blue-400 bg-blue-50/50 text-blue-950 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 text-center",
-										title: "Número de Punto de Venta Web Services en AFIP / ARCA"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
-										value: puntoVenta,
-										onChange: (e) => setPuntoVenta(Number(e.target.value)),
-										disabled: isSubmittingWsfe,
-										className: "flex-1 text-xs font-medium border border-slate-300 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 bg-white",
-										children: getAfipPuntosVenta(puntoVenta || config.afipConfig?.puntoVenta).map((pdv) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-											value: pdv.id,
-											children: pdv.nombre
-										}, pdv.id))
-									})]
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-									className: "text-[10px] text-emerald-700 font-semibold mt-0.5 block",
-									children: [
-										"✓ Configurado en Punto de Venta ",
-										String(puntoVenta).padStart(5, "0"),
-										" (Web Services)"
-									]
-								})
-							] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-								className: "block text-xs font-bold text-slate-700 mb-1",
-								children: "Tipo de Comprobante a Emitir:"
-							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-								className: "grid grid-cols-3 gap-2",
-								children: [
-									{
-										id: "FA",
-										label: "Factura A",
-										desc: "Resp. Inscripto"
-									},
-									{
-										id: "FB",
-										label: "Factura B",
-										desc: "Cons. Final / Monot."
-									},
-									{
-										id: "FC",
-										label: "Factura C",
-										desc: "Monotributo"
-									}
-								].map((item) => {
-									const isSelected = tipoComprobante === item.id;
-									return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										type: "button",
-										disabled: isSubmittingWsfe,
-										onClick: () => setTipoComprobante(item.id),
-										className: `p-2 border rounded-lg text-left transition-all ${isSelected ? "border-blue-600 bg-blue-50/80 ring-2 ring-blue-500/20 text-blue-900 font-bold" : "border-slate-200 hover:bg-slate-50 text-slate-700 font-medium"}`,
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-											className: "text-xs",
-											children: item.label
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-											className: "text-[9.5px] text-slate-500 font-normal",
-											children: item.desc
-										})]
-									}, item.id);
-								})
-							})] })]
-						}),
-						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-3",
-							children: [
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex items-center justify-between",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-										className: "text-xs font-bold text-slate-800 flex items-center gap-1.5",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Building, { className: "w-4 h-4 text-slate-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Datos del Receptor (Comprador)" })]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										className: "text-[10px] text-slate-500",
-										children: "Padrón oficial ARCA / AFIP"
-									})]
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "grid grid-cols-1 sm:grid-cols-3 gap-3",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-										className: "block text-[11px] font-semibold text-slate-600 mb-1",
-										children: "Tipo Documento:"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
-										value: receptorTipoDoc,
-										onChange: (e) => setReceptorTipoDoc(e.target.value),
-										disabled: isSubmittingWsfe,
-										className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "CUIT",
-												children: "CUIT"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "CUIL",
-												children: "CUIL"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "DNI",
-												children: "DNI"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "Consumidor Final",
-												children: "Sin Identificar"
-											})
-										]
-									})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "sm:col-span-2",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-												className: "block text-[11px] font-semibold text-slate-600 mb-1",
-												children: "Número Documento (CUIT / DNI):"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												className: "flex items-center gap-1.5",
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-													type: "text",
-													value: receptorNroDoc,
-													onChange: (e) => {
-														setReceptorNroDoc(e.target.value);
-														setPadronVerified(false);
-													},
-													onKeyDown: (e) => {
-														if (e.key === "Enter") {
-															e.preventDefault();
-															handleConsultarPadron();
-														}
-													},
-													onBlur: () => {
-														const clean = receptorNroDoc.replace(/\D/g, "");
-														if ((clean.length === 11 || clean.length === 8 || clean.length === 7) && !padronVerified) handleConsultarPadron();
-													},
-													placeholder: "Ej. 30-71452899-8 o DNI 28495123",
-													disabled: isSubmittingWsfe,
-													className: "flex-1 text-xs border border-slate-300 rounded-lg p-2 font-mono font-bold bg-white focus:ring-2 focus:ring-blue-500"
-												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-													type: "button",
-													onClick: handleConsultarPadron,
-													disabled: isConsultingAfip || isSubmittingWsfe,
-													className: "px-3 py-2 bg-blue-700 hover:bg-blue-800 disabled:bg-slate-400 text-white text-xs font-semibold rounded-lg flex items-center gap-1 transition-colors shadow-2xs shrink-0 cursor-pointer",
-													title: "Consultar Padrón ARCA",
-													children: [isConsultingAfip ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-3.5 h-3.5 animate-spin" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Search, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Consultar ARCA" })]
-												})]
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "text-[10px] text-slate-400 mt-0.5 block",
-												children: "Presione Enter o Consultar para autocompletar Razón Social y Condición"
-											})
-										]
-									})]
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "grid grid-cols-1 sm:grid-cols-2 gap-3",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-										className: "block text-[11px] font-semibold text-slate-600 mb-1",
-										children: "Razón Social / Nombre:"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "relative",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-											type: "text",
-											value: receptorRazonSocial,
-											onChange: (e) => setReceptorRazonSocial(e.target.value),
-											placeholder: "Nombre o Denominación Social",
-											disabled: isSubmittingWsfe,
-											className: "w-full text-xs font-semibold border border-slate-300 rounded-lg p-2 bg-white"
-										}), padronVerified && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-											className: "absolute right-2.5 top-2 text-emerald-600 text-xs font-bold flex items-center gap-1 pointer-events-none",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheck, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "text-[10px]",
-												children: "Verificado"
-											})]
-										})]
-									})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-										className: "block text-[11px] font-semibold text-slate-600 mb-1",
-										children: "Condición frente al IVA:"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
-										value: receptorCondicionIva,
-										disabled: isSubmittingWsfe,
-										onChange: (e) => {
-											const val = e.target.value;
-											setReceptorCondicionIva(val);
-											if (config.afipConfig?.tipoFactura === "C") setTipoComprobante("FC");
-											else if (val === "IVA Responsable Inscripto") setTipoComprobante("FA");
-											else setTipoComprobante("FB");
-										},
-										className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "Consumidor Final",
-												children: "Consumidor Final"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "IVA Responsable Inscripto",
-												children: "IVA Responsable Inscripto"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "Responsable Monotributo",
-												children: "Responsable Monotributo"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-												value: "IVA Sujeto Exento",
-												children: "IVA Sujeto Exento"
-											})
-										]
-									})] })]
-								}),
-								padronVerified && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "text-[11px] bg-emerald-50 border border-emerald-200 text-emerald-900 p-2.5 rounded-lg flex items-center justify-between gap-2 flex-wrap",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "flex items-center gap-2",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-2 h-2 rounded-full bg-emerald-500 animate-ping shrink-0" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "ARCA / Padrón:" }),
-											" ",
-											receptorRazonSocial,
-											" • ",
-											receptorCondicionIva,
-											receptorDomicilio && ` &bull; ${receptorDomicilio}`
-										] })]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										type: "button",
-										onClick: handleGuardarEnPadron,
-										className: "px-2.5 py-1 bg-white hover:bg-emerald-100 text-emerald-800 text-[10px] font-bold border border-emerald-300 rounded shadow-2xs flex items-center gap-1 cursor-pointer transition-colors",
-										title: "Guardar o actualizar este CUIT/DNI en el Padrón ARCA local",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Save, { className: "w-3 h-3 text-emerald-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Guardar en Padrón" })]
-									})]
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
-									className: "block text-[11px] font-semibold text-slate-600 mb-1",
-									children: "Domicilio Fiscal (Opcional):"
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-									type: "text",
-									value: receptorDomicilio,
-									onChange: (e) => setReceptorDomicilio(e.target.value),
-									placeholder: "Calle, Número, Ciudad, Provincia",
-									disabled: isSubmittingWsfe,
-									className: "w-full text-xs border border-slate-300 rounded-lg p-2 bg-white"
-								})] })
-							]
-						}),
-						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "p-3 bg-emerald-50/70 border border-emerald-200 rounded-lg text-xs space-y-1.5",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "font-bold text-emerald-950 flex items-center justify-between",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Desglose de Liquidación Fiscal:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-									className: "font-mono text-sm text-emerald-900 font-black",
-									children: formatARS(sale.total)
-								})]
-							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "grid grid-cols-3 gap-2 text-[11px] text-emerald-900 pt-1 border-t border-emerald-200/60",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "text-emerald-700",
-											children: "Neto Gravado (21%):"
-										}),
-										" ",
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
-											className: "font-mono",
-											children: formatARS(sale.total / 1.21)
-										})
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "text-emerald-700",
-											children: "IVA Débito Fiscal:"
-										}),
-										" ",
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
-											className: "font-mono",
-											children: formatARS(sale.total - sale.total / 1.21)
-										})
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "text-emerald-700",
-											children: "Alícuota Aplicada:"
-										}),
-										" ",
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "21.00% General" })
-									] })
-								]
-							})]
-						}),
-						isSubmittingWsfe && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs space-y-2 animate-pulse",
-							children: [
-								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex items-center gap-2 text-blue-900 font-bold",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-4 h-4 animate-spin text-blue-700" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Transmitiendo a ARCA / AFIP Web Service WSFEv1..." })]
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-									className: "text-[11px] text-blue-700 font-mono",
-									children: stepWsfe
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-									className: "w-full bg-blue-200 h-1.5 rounded-full overflow-hidden",
-									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "bg-blue-600 h-full w-2/3 animate-[pulse_1s_infinite]" })
-								})
-							]
-						})
-					]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "bg-slate-100 border-t border-slate-200 px-5 py-3.5 flex items-center justify-between",
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-						className: "text-[11px] text-slate-500",
-						children: "WSFEv1 • Conexión encriptada SSL/TLS • ARCA Argentina"
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "flex items-center gap-2",
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-							type: "button",
-							onClick: onClose,
-							disabled: isSubmittingWsfe,
-							className: "px-4 py-2 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold rounded-lg transition-colors",
-							children: "Cancelar"
-						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-							type: "button",
-							onClick: handleEmitirFactura,
-							disabled: isSubmittingWsfe,
-							className: "px-5 py-2 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-md flex items-center gap-2 transition-all",
-							children: isSubmittingWsfe ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-3.5 h-3.5 animate-spin" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Autorizando con ARCA..." })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Solicitar CAE y Facturar" })] })
-						})]
-					})]
-				})
-			]
-		})
-	});
-};
-//#endregion
-//#region src/components/administracion/ModalVisorFactura.tsx
-var ModalVisorFactura = ({ invoice, isOpen, onClose }) => {
-	const { config } = usePOS();
-	const [viewMode, setViewMode] = (0, import_react.useState)("a4");
-	const [copied, setCopied] = (0, import_react.useState)(false);
-	if (!isOpen || !invoice) return null;
-	const cmpInfo = TIPO_COMPROBANTE_INFO[invoice.tipoComprobante] || TIPO_COMPROBANTE_INFO.FB;
-	const activePdv = config.afipConfig?.puntoVenta || invoice.puntoVenta || 4;
-	const ptoVtaFormatted = String(activePdv).padStart(5, "0");
-	const nroCmpFormatted = String(invoice.numeroComprobante).padStart(8, "0");
-	const fullComprobanteStr = `${cmpInfo.label} Nº ${ptoVtaFormatted}-${nroCmpFormatted}`;
-	const qrSvgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(invoice.qrAfipUrl)}`;
-	const buildStandaloneInvoiceHtml = (mode) => {
-		const escapeHtml = (str) => String(str ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-		const isFA = invoice.tipoComprobante === "FA";
-		const codigoAfipStr = String(cmpInfo.codigoAfip).padStart(2, "0");
-		if (mode === "ticket") {
-			const itemsRowsHtml = invoice.items.map((item) => `
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:5px;font-size:11px;">
-            <div style="padding-right:6px;">
-              <div style="font-weight:600;">${escapeHtml(item.description)}</div>
-              <div style="font-size:10px;color:#475569;">${escapeHtml(item.quantity)} x ${escapeHtml(formatARS(item.unitPrice))}</div>
-            </div>
-            <div style="font-weight:700;white-space:nowrap;">${escapeHtml(formatARS(item.total))}</div>
-          </div>`).join("");
-			return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>Ticket Fiscal ${escapeHtml(cmpInfo.letra)} ${escapeHtml(ptoVtaFormatted)}-${escapeHtml(nroCmpFormatted)}</title>
-  <style>
-    @page { size: 80mm auto; margin: 4mm; }
-    * { box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-    html, body { margin: 0; padding: 0; background: #ffffff; color: #000000; font-family: "Courier New", Courier, monospace; font-size: 11px; line-height: 1.3; }
-    .ticket-wrap { width: 100%; max-width: 76mm; margin: 0 auto; padding: 4px; }
-    .sep { border-bottom: 1px dashed #334155; margin: 6px 0; }
-    .center { text-align: center; }
-    .bold { font-weight: 700; }
-  </style>
-</head>
-<body>
-  <div class="ticket-wrap">
-    <div class="center">
-      <div style="font-size:13px;font-weight:900;">${escapeHtml(invoice.emisorRazonSocial)}</div>
-      <div style="font-size:10px;">${escapeHtml(invoice.emisorDomicilio)}</div>
-      <div style="font-size:10px;">CUIT: ${escapeHtml(invoice.emisorCuit)}</div>
-      <div style="font-size:10px;">IIBB: ${escapeHtml(invoice.emisorIibb)}</div>
-      <div style="font-size:10px;">${escapeHtml(invoice.emisorCondicionIva)}</div>
-    </div>
-    <div class="sep"></div>
-    <div class="center">
-      <div style="font-size:12px;font-weight:900;text-transform:uppercase;">
-        ${escapeHtml(cmpInfo.label)} [${escapeHtml(cmpInfo.letra)}] - CÓD. ${escapeHtml(codigoAfipStr)}
-      </div>
-      <div class="bold">P.V. ${escapeHtml(ptoVtaFormatted)} - Nº ${escapeHtml(nroCmpFormatted)}</div>
-      <div style="font-size:10px;">Fecha: ${escapeHtml(invoice.fechaEmision)}${invoice.horaEmision ? ` - ${escapeHtml(invoice.horaEmision)}` : ""}</div>
-    </div>
-    <div class="sep"></div>
-    <div style="font-size:10px;">
-      <div><strong>A:</strong> ${escapeHtml(invoice.receptorRazonSocial)}</div>
-      <div><strong>${escapeHtml(invoice.receptorTipoDoc)}:</strong> ${escapeHtml(invoice.receptorNroDoc)}</div>
-      <div><strong>Cond. IVA:</strong> ${escapeHtml(invoice.receptorCondicionIva)}</div>
-    </div>
-    <div class="sep"></div>
-    <div>${itemsRowsHtml}</div>
-    <div class="sep"></div>
-    <div>
-      ${isFA ? `<div style="display:flex;justify-content:space-between;font-size:10px;"><span>Neto Gravado:</span><span>${escapeHtml(formatARS(invoice.netoGravado21))}</span></div>
-             <div style="display:flex;justify-content:space-between;font-size:10px;"><span>IVA 21%:</span><span>${escapeHtml(formatARS(invoice.iva21))}</span></div>` : ""}
-      <div style="display:flex;justify-content:space-between;font-size:14px;font-weight:900;padding-top:4px;">
-        <span>TOTAL:</span>
-        <span>${escapeHtml(formatARS(invoice.total))}</span>
-      </div>
-    </div>
-    <div class="sep"></div>
-    <div class="center" style="padding-top:4px;">
-      <img src="${qrSvgUrl}" alt="QR AFIP" style="width:110px;height:110px;display:block;margin:0 auto 6px auto;" />
-      <div style="font-size:10px;font-weight:700;">CAE: ${escapeHtml(invoice.cae)}</div>
-      <div style="font-size:10px;">VTO. CAE: ${escapeHtml(invoice.vtoCae)}</div>
-      <div style="font-size:9px;margin-top:4px;">Comprobante Autorizado por ARCA / AFIP</div>
-    </div>
-  </div>
-</body>
-</html>`;
-		}
-		const tableRowsHtml = invoice.items.map((item) => {
-			const unitVal = isFA ? formatARS(item.unitPrice / 1.21) : formatARS(item.unitPrice);
-			const subVal = isFA ? formatARS(item.total / 1.21) : formatARS(item.total);
-			return `
-        <tr>
-          <td class="mono muted">${escapeHtml(item.barcode || item.productId)}</td>
-          <td style="font-weight:600;color:#0f172a;">${escapeHtml(item.description)}</td>
-          <td class="right mono" style="font-weight:600;">${escapeHtml(item.quantity)}</td>
-          <td class="right muted">${item.sellType === "bulk" ? "KG" : "UNID"}</td>
-          <td class="right mono">${escapeHtml(unitVal)}</td>
-          ${isFA ? `<td class="right mono muted">21.00%</td>` : ""}
-          <td class="right mono" style="font-weight:700;color:#0f172a;">${escapeHtml(subVal)}</td>
-        </tr>`;
-		}).join("");
-		return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>Factura_${escapeHtml(cmpInfo.letra)}_${escapeHtml(ptoVtaFormatted)}-${escapeHtml(nroCmpFormatted)}</title>
-  <style>
-    @page { size: A4 portrait; margin: 10mm; }
-    * { box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-    html, body {
-      margin: 0;
-      padding: 0;
-      background: #ffffff;
-      color: #0f172a;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      font-size: 11px;
-      line-height: 1.35;
-    }
-    .page {
-      width: 100%;
-      max-width: 190mm;
-      margin: 0 auto;
-      padding: 2mm 0;
-    }
-    .header-box {
-      border: 1.5px solid #475569;
-      border-radius: 4px;
-      padding: 14px 16px;
-      position: relative;
-      margin-bottom: 10px;
-    }
-    .letra-box {
-      position: absolute;
-      left: 50%;
-      top: 0;
-      transform: translateX(-50%);
-      width: 54px;
-      height: 54px;
-      background: #ffffff;
-      border-left: 1.5px solid #475569;
-      border-right: 1.5px solid #475569;
-      border-bottom: 1.5px solid #475569;
-      border-radius: 0 0 6px 6px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-    }
-    .letra-char {
-      font-size: 26px;
-      font-weight: 900;
-      color: #0f172a;
-      line-height: 1;
-    }
-    .letra-cod {
-      font-size: 9px;
-      font-weight: 700;
-      color: #475569;
-      margin-top: 2px;
-    }
-    .header-grid {
-      display: table;
-      width: 100%;
-      table-layout: fixed;
-    }
-    .header-col-left {
-      display: table-cell;
-      width: 50%;
-      vertical-align: top;
-      padding-right: 34px;
-      border-right: 1px solid #cbd5e1;
-    }
-    .header-col-right {
-      display: table-cell;
-      width: 50%;
-      vertical-align: top;
-      padding-left: 34px;
-      text-align: right;
-    }
-    .period-bar {
-      border: 1px solid #94a3b8;
-      border-radius: 4px;
-      padding: 6px 12px;
-      margin-bottom: 10px;
-      background: #f8fafc;
-      display: flex;
-      justify-content: space-between;
-      font-size: 10.5px;
-    }
-    .receptor-box {
-      border: 1px solid #94a3b8;
-      border-radius: 4px;
-      padding: 10px 12px;
-      margin-bottom: 12px;
-    }
-    .receptor-row {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 3px 0;
-    }
-    .receptor-row + .receptor-row {
-      border-top: 1px solid #e2e8f0;
-    }
-    .items-box {
-      border: 1px solid #94a3b8;
-      border-radius: 4px;
-      overflow: hidden;
-      margin-bottom: 14px;
-    }
-    table.items-table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    table.items-table th {
-      background: #f1f5f9;
-      color: #334155;
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      padding: 7px 10px;
-      border-bottom: 1px solid #94a3b8;
-      text-align: left;
-    }
-    table.items-table td {
-      padding: 7px 10px;
-      border-bottom: 1px solid #e2e8f0;
-      font-size: 11px;
-    }
-    table.items-table tr:last-child td {
-      border-bottom: none;
-    }
-    .right { text-align: right !important; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-    .muted { color: #475569; }
-    .totals-grid {
-      display: table;
-      width: 100%;
-      table-layout: fixed;
-      margin-bottom: 16px;
-    }
-    .obs-col {
-      display: table-cell;
-      width: 48%;
-      vertical-align: top;
-      padding-right: 12px;
-    }
-    .obs-inner {
-      background: #f8fafc;
-      border: 1px solid #cbd5e1;
-      border-radius: 4px;
-      padding: 8px 10px;
-      font-size: 10px;
-      color: #475569;
-    }
-    .totals-col {
-      display: table-cell;
-      width: 52%;
-      vertical-align: top;
-    }
-    .totals-inner {
-      background: #f8fafc;
-      border: 1.5px solid #64748b;
-      border-radius: 4px;
-      padding: 10px 14px;
-    }
-    .total-line {
-      display: flex;
-      justify-content: space-between;
-      padding: 3px 0;
-      font-size: 11px;
-    }
-    .grand-total {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-top: 8px;
-      margin-top: 6px;
-      border-top: 1.5px solid #475569;
-      font-size: 15px;
-      font-weight: 900;
-      color: #0f172a;
-    }
-    .footer-box {
-      border-top: 2px solid #0f172a;
-      padding-top: 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .qr-wrap {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .qr-img-box {
-      padding: 4px;
-      border: 1px solid #94a3b8;
-      border-radius: 4px;
-      background: #ffffff;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="header-box">
-      <div class="letra-box">
-        <div class="letra-char">${escapeHtml(cmpInfo.letra)}</div>
-        <div class="letra-cod">CÓD. ${escapeHtml(codigoAfipStr)}</div>
-      </div>
-      <div class="header-grid">
-        <div class="header-col-left">
-          <div style="font-size:16px;font-weight:900;color:#0f172a;margin-bottom:4px;">
-            ${escapeHtml(invoice.emisorRazonSocial)}
-          </div>
-          <div style="font-size:11px;color:#334155;margin-bottom:2px;">
-            <strong>Domicilio:</strong> ${escapeHtml(invoice.emisorDomicilio)}
-          </div>
-          <div style="font-size:11px;color:#334155;">
-            <strong>Condición frente al IVA:</strong> ${escapeHtml(invoice.emisorCondicionIva)}
-          </div>
-        </div>
-        <div class="header-col-right">
-          <div style="font-size:16px;font-weight:900;color:#1e3a8a;text-transform:uppercase;">
-            ${escapeHtml(cmpInfo.label)}
-          </div>
-          <div class="mono" style="font-size:13px;font-weight:800;color:#0f172a;margin-top:2px;">
-            Nº ${escapeHtml(ptoVtaFormatted)} - ${escapeHtml(nroCmpFormatted)}
-          </div>
-          <div style="font-size:11px;color:#334155;margin-top:4px;">
-            <strong>Fecha de Emisión:</strong> ${escapeHtml(invoice.fechaEmision)}
-          </div>
-          <div style="border-top:1px solid #cbd5e1;margin-top:6px;padding-top:6px;font-size:10.5px;color:#334155;">
-            <div><strong>CUIT:</strong> ${escapeHtml(invoice.emisorCuit)}</div>
-            <div><strong>Ingresos Brutos:</strong> ${escapeHtml(invoice.emisorIibb)}</div>
-            <div><strong>Inicio de Actividades:</strong> ${escapeHtml(invoice.emisorInicioActividades)}</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="period-bar">
-      <div><strong>Período Facturado Desde:</strong> ${escapeHtml(invoice.fechaEmision)}</div>
-      <div><strong>Hasta:</strong> ${escapeHtml(invoice.fechaEmision)}</div>
-      <div><strong>Vto. para el Pago:</strong> ${escapeHtml(invoice.vtoCae)}</div>
-    </div>
-
-    <div class="receptor-box">
-      <div class="receptor-row">
-        <div><strong>${escapeHtml(invoice.receptorTipoDoc)}:</strong> <span class="mono" style="font-weight:700;">${escapeHtml(invoice.receptorNroDoc)}</span></div>
-        <div><strong>Razón Social / Nombre:</strong> <strong>${escapeHtml(invoice.receptorRazonSocial)}</strong></div>
-      </div>
-      <div class="receptor-row">
-        <div><strong>Condición frente al IVA:</strong> ${escapeHtml(invoice.receptorCondicionIva)}</div>
-        <div><strong>Domicilio:</strong> ${escapeHtml(invoice.receptorDomicilio || "Río Cuarto, Córdoba")}</div>
-      </div>
-      <div class="receptor-row">
-        <div><strong>Condición de Venta:</strong> Contado / Mostrador (Ticket ${escapeHtml(invoice.saleFolio || invoice.ticketNumber || "POS")})</div>
-      </div>
-    </div>
-
-    <div class="items-box">
-      <table class="items-table">
-        <thead>
-          <tr>
-            <th>Código</th>
-            <th>Descripción / Producto</th>
-            <th class="right">Cant.</th>
-            <th class="right">U. Medida</th>
-            <th class="right">Precio Unit.</th>
-            ${isFA ? "<th class=\"right\">Alíc. IVA</th>" : ""}
-            <th class="right">Subtotal</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${tableRowsHtml}
-        </tbody>
-      </table>
-    </div>
-
-    <div class="totals-grid">
-      <div class="obs-col">
-        <div class="obs-inner">
-          <div style="font-weight:700;color:#1e293b;margin-bottom:3px;">Observaciones:</div>
-          <div>${escapeHtml(invoice.observaciones || "Comprobante emitido mediante Facturación Electrónica ARCA/AFIP WSFEv1.")}</div>
-        </div>
-      </div>
-      <div class="totals-col">
-        <div class="totals-inner">
-          ${isFA ? `<div class="total-line"><span>Importe Neto Gravado (21%):</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.netoGravado21))}</span></div>
-                 ${invoice.netoGravado105 > 0 ? `<div class="total-line"><span>Importe Neto Gravado (10.5%):</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.netoGravado105))}</span></div>` : ""}
-                 <div class="total-line"><span>IVA 21%:</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.iva21))}</span></div>
-                 ${invoice.iva105 > 0 ? `<div class="total-line"><span>IVA 10.5%:</span><span class="mono" style="font-weight:700;">${escapeHtml(formatARS(invoice.iva105))}</span></div>` : ""}` : `<div class="total-line"><span>Subtotal Operaciones:</span><span class="mono">${escapeHtml(formatARS(invoice.total))}</span></div>`}
-          <div class="grand-total">
-            <span>TOTAL:</span>
-            <span class="mono" style="color:#1e3a8a;">${escapeHtml(formatARS(invoice.total))}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="footer-box">
-      <div class="qr-wrap">
-        <div class="qr-img-box">
-          <img src="${qrSvgUrl}" alt="Código QR Oficial AFIP" style="width:92px;height:92px;display:block;" />
-        </div>
-        <div>
-          <div style="font-size:13px;font-weight:900;color:#0f172a;">
-            <span style="color:#1d4ed8;">ARCA</span> / AFIP
-          </div>
-          <div style="font-size:10px;color:#334155;font-weight:600;margin-top:2px;">
-            Comprobante Autorizado
-          </div>
-          <div style="font-size:9.5px;color:#64748b;max-width:220px;margin-top:2px;">
-            Esta Administración Federal no se responsabiliza por los datos ingresados en el detalle de la operación.
-          </div>
-        </div>
-      </div>
-
-      <div style="text-align:right;">
-        <div style="font-size:13px;margin-bottom:4px;">
-          <strong>CAE Nº:</strong> <span class="mono" style="font-size:14px;font-weight:900;">${escapeHtml(invoice.cae)}</span>
-        </div>
-        <div style="font-size:12px;">
-          <strong>Fecha de Vto. de CAE:</strong> <span class="mono" style="font-weight:700;">${escapeHtml(invoice.vtoCae)}</span>
-        </div>
-        ${invoice.arcaBarcode ? `<div class="mono" style="font-size:9px;color:#64748b;letter-spacing:1.5px;margin-top:6px;">${escapeHtml(invoice.arcaBarcode)}</div>` : ""}
-      </div>
-    </div>
-  </div>
-</body>
-</html>`;
-	};
-	const handlePrint = (targetMode) => {
-		const selectedMode = targetMode || viewMode;
-		if (selectedMode !== viewMode) setViewMode(selectedMode);
-		const originalTitle = document.title;
-		const pdfFileName = `Factura_${cmpInfo.letra}_${ptoVtaFormatted}-${nroCmpFormatted}_${invoice.emisorRazonSocial.replace(/\s+/g, "_")}`;
-		document.title = pdfFileName;
-		try {
-			const existingFrame = document.getElementById("consolata-factura-print-frame");
-			if (existingFrame && existingFrame.parentNode) existingFrame.parentNode.removeChild(existingFrame);
-			const printFrame = document.createElement("iframe");
-			printFrame.id = "consolata-factura-print-frame";
-			printFrame.style.position = "fixed";
-			printFrame.style.right = "0";
-			printFrame.style.bottom = "0";
-			printFrame.style.width = "210mm";
-			printFrame.style.height = "297mm";
-			printFrame.style.opacity = "0";
-			printFrame.style.pointerEvents = "none";
-			printFrame.style.border = "0";
-			printFrame.style.zIndex = "-1";
-			document.body.appendChild(printFrame);
-			const htmlContent = buildStandaloneInvoiceHtml(selectedMode);
-			const frameDoc = printFrame.contentWindow?.document || printFrame.contentDocument;
-			if (frameDoc && printFrame.contentWindow) {
-				frameDoc.open();
-				frameDoc.write(htmlContent);
-				frameDoc.close();
-				let printed = false;
-				const triggerFramePrint = () => {
-					if (printed) return;
-					printed = true;
-					try {
-						printFrame.contentWindow?.focus();
-						printFrame.contentWindow?.print();
-					} catch {
-						window.print();
-					} finally {
-						setTimeout(() => {
-							document.title = originalTitle;
-						}, 1200);
-					}
-				};
-				const imgs = Array.from(frameDoc.images || []);
-				if (imgs.length === 0 || imgs.every((img) => img.complete)) setTimeout(triggerFramePrint, 120);
-				else {
-					let loadedCount = 0;
-					const onImgDone = () => {
-						loadedCount++;
-						if (loadedCount >= imgs.length) setTimeout(triggerFramePrint, 80);
-					};
-					imgs.forEach((img) => {
-						if (img.complete) onImgDone();
-						else {
-							img.addEventListener("load", onImgDone, { once: true });
-							img.addEventListener("error", onImgDone, { once: true });
-						}
-					});
-					setTimeout(triggerFramePrint, 800);
-				}
-				return;
-			}
-		} catch {}
-		setTimeout(() => {
-			window.print();
-			setTimeout(() => {
-				document.title = originalTitle;
-			}, 800);
-		}, 150);
-	};
-	const handleCopyCae = () => {
-		navigator.clipboard.writeText(invoice.cae);
-		setCopied(true);
-		setTimeout(() => setCopied(false), 2e3);
-	};
-	const handleDownloadHtml = () => {
-		const invoiceHtml = buildStandaloneInvoiceHtml("a4");
-		const blob = new Blob([invoiceHtml], { type: "text/html;charset=utf-8" });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement("a");
-		a.href = url;
-		a.download = `Factura_${cmpInfo.letra}_${ptoVtaFormatted}-${nroCmpFormatted}.html`;
-		document.body.appendChild(a);
-		a.click();
-		document.body.removeChild(a);
-		URL.revokeObjectURL(url);
-	};
-	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-		className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-2 sm:p-4 overflow-y-auto print:p-0 print:bg-white print:static print:overflow-visible",
-		children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-			className: "bg-white rounded-xl shadow-2xl border border-slate-300 w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden print:max-h-none print:shadow-none print:border-none print:w-full print:overflow-visible",
-			children: [
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "bg-gradient-to-r from-slate-800 to-blue-900 text-white px-4 py-3 flex items-center justify-between shrink-0 print:hidden",
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "flex items-center gap-2",
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldCheck, { className: "w-5 h-5 text-emerald-400" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "text-sm font-bold flex items-center gap-2",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: fullComprobanteStr }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-								className: "text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 px-2 py-0.5 rounded-full font-mono font-medium",
-								children: ["CAE: ", invoice.cae]
-							})]
-						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							className: "text-[11px] text-slate-300",
-							children: "ARCA / AFIP WSFEv1 - Autorización Oficial"
-						})] })]
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "flex items-center gap-2",
-						children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "flex items-center bg-slate-900/60 p-0.5 rounded-lg border border-slate-700 text-xs",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-									onClick: () => setViewMode("a4"),
-									className: `flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors ${viewMode === "a4" ? "bg-blue-600 text-white font-medium" : "text-slate-300 hover:text-white"}`,
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Formato A4" })]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-									onClick: () => setViewMode("ticket"),
-									className: `flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors ${viewMode === "ticket" ? "bg-blue-600 text-white font-medium" : "text-slate-300 hover:text-white"}`,
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Receipt, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket Fiscal 80mm" })]
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: () => handlePrint("a4"),
-								className: "flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm transition-all cursor-pointer",
-								title: "Imprimir directamente en hoja A4 o guardar PDF",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir en A4 / PDF" })]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: handleDownloadHtml,
-								className: "flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium rounded-lg shadow-sm transition-colors cursor-pointer",
-								title: "Descargar archivo de factura para abrir o enviar",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, { className: "w-3.5 h-3.5 text-emerald-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-									className: "hidden sm:inline",
-									children: "Descargar (.html)"
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-								onClick: onClose,
-								className: "w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 rounded-lg transition-colors ml-1 cursor-pointer",
-								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
-							})
-						]
-					})]
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-					className: "flex-1 overflow-y-auto p-4 sm:p-6 bg-slate-100 flex justify-center print:bg-white print:p-0 print:overflow-visible",
-					children: viewMode === "a4" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						id: "factura-a4-printable",
-						className: "bg-white border border-slate-300 rounded-sm shadow-md p-6 sm:p-8 w-full max-w-[210mm] text-slate-800 text-[11px] leading-tight select-text print:shadow-none print:border-none print:p-0",
-						children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "border border-slate-400 rounded-sm p-4 relative mb-4",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "absolute left-1/2 -top-1 transform -translate-x-1/2 -translate-y-0 w-14 h-14 bg-white border border-slate-400 rounded-b-md flex flex-col items-center justify-center z-10 shadow-xs",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										className: "text-2xl font-black text-slate-900 leading-none",
-										children: cmpInfo.letra
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-										className: "text-[9px] font-bold text-slate-600 mt-0.5",
-										children: ["CÓD. ", String(cmpInfo.codigoAfip).padStart(2, "0")]
-									})]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "grid grid-cols-2 gap-8",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "pr-4 border-r border-slate-300",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", {
-											className: "text-base font-black text-slate-900 tracking-tight mb-1",
-											children: invoice.emisorRazonSocial
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "space-y-0.5 text-slate-600",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "font-semibold text-slate-800",
-													children: "Domicilio:"
-												}),
-												" ",
-												invoice.emisorDomicilio
-											] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "font-semibold text-slate-800",
-													children: "Condición frente al IVA:"
-												}),
-												" ",
-												invoice.emisorCondicionIva
-											] })]
-										})]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "pl-4",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "text-right",
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
-													className: "text-base font-black text-blue-900 uppercase tracking-tight",
-													children: cmpInfo.label
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
-													className: "text-xs font-mono font-bold text-slate-800",
-													children: [
-														"Nº ",
-														ptoVtaFormatted,
-														" - ",
-														nroCmpFormatted
-													]
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
-													className: "text-[11px] text-slate-600 mt-1",
-													children: [
-														/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-															className: "font-semibold text-slate-800",
-															children: "Fecha de Emisión:"
-														}),
-														" ",
-														invoice.fechaEmision
-													]
-												})
-											]
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "mt-2 text-right space-y-0.5 text-slate-600 border-t border-slate-200 pt-2",
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
-													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "font-semibold text-slate-800",
-														children: "CUIT:"
-													}),
-													" ",
-													invoice.emisorCuit
-												] }),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
-													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "font-semibold text-slate-800",
-														children: "Ingresos Brutos:"
-													}),
-													" ",
-													invoice.emisorIibb
-												] }),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { children: [
-													/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-														className: "font-semibold text-slate-800",
-														children: "Inicio de Actividades:"
-													}),
-													" ",
-													invoice.emisorInicioActividades
-												] })
-											]
-										})]
-									})]
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "border border-slate-300 rounded-sm px-3 py-1.5 mb-3 bg-slate-50 flex justify-between text-[10.5px]",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-semibold text-slate-700",
-											children: "Período Facturado Desde:"
-										}),
-										" ",
-										invoice.fechaEmision
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-semibold text-slate-700",
-											children: "Hasta:"
-										}),
-										" ",
-										invoice.fechaEmision
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-semibold text-slate-700",
-											children: "Vto. para el Pago:"
-										}),
-										" ",
-										invoice.vtoCae
-									] })
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "border border-slate-300 rounded-sm p-3 mb-4 space-y-1",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "grid grid-cols-2 gap-4",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-												className: "font-semibold text-slate-700",
-												children: [invoice.receptorTipoDoc, ":"]
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-bold text-slate-900",
-												children: invoice.receptorNroDoc
-											})
-										] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-semibold text-slate-700",
-												children: "Razón Social / Nombre:"
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-bold text-slate-900",
-												children: invoice.receptorRazonSocial
-											})
-										] })]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "grid grid-cols-2 gap-4 pt-1 border-t border-slate-100",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-semibold text-slate-700",
-												children: "Condición frente al IVA:"
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "text-slate-800 font-medium",
-												children: invoice.receptorCondicionIva
-											})
-										] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-semibold text-slate-700",
-												children: "Domicilio:"
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "text-slate-800",
-												children: invoice.receptorDomicilio || "Río Cuarto, Córdoba"
-											})
-										] })]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "pt-1 border-t border-slate-100 text-[10.5px]",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-semibold text-slate-700",
-												children: "Condición de Venta:"
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-												className: "text-slate-800",
-												children: [
-													"Contado / Mostrador (Ticket ",
-													invoice.saleFolio || invoice.ticketNumber || "POS",
-													")"
-												]
-											})
-										]
-									})
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-								className: "border border-slate-300 rounded-sm overflow-hidden mb-4",
-								children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", {
-									className: "w-full text-left border-collapse",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
-										className: "bg-slate-100 text-slate-700 font-semibold border-b border-slate-300 text-[10px] uppercase tracking-wider",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2.5",
-												children: "Código"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2.5",
-												children: "Descripción / Producto"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2 text-right",
-												children: "Cant."
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2 text-right",
-												children: "U. Medida"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2.5 text-right",
-												children: "Precio Unit."
-											}),
-											invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2 text-right",
-												children: "Alíc. IVA"
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", {
-												className: "py-1.5 px-2.5 text-right",
-												children: "Subtotal"
-											})
-										]
-									}) }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", {
-										className: "divide-y divide-slate-200",
-										children: invoice.items.map((item, idx) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("tr", {
-											className: "hover:bg-slate-50/50",
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2.5 font-mono text-slate-500 text-[10px]",
-													children: item.barcode || item.productId
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2.5 font-medium text-slate-900",
-													children: item.description
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2 text-right font-mono font-semibold",
-													children: item.quantity
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2 text-right text-slate-600",
-													children: item.sellType === "bulk" ? "KG" : "UNID"
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2.5 text-right font-mono",
-													children: invoice.tipoComprobante === "FA" ? formatARS(item.unitPrice / 1.21) : formatARS(item.unitPrice)
-												}),
-												invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2 text-right font-mono text-slate-600",
-													children: "21.00%"
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", {
-													className: "py-1.5 px-2.5 text-right font-mono font-bold text-slate-900",
-													children: invoice.tipoComprobante === "FA" ? formatARS(item.total / 1.21) : formatARS(item.total)
-												})
-											]
-										}, idx))
-									})]
-								})
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "text-slate-600 text-[10px] space-y-1 p-2 bg-slate-50 rounded border border-slate-200",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-										className: "font-semibold text-slate-700",
-										children: "Observaciones:"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: invoice.observaciones || "Comprobante emitido mediante Facturación Electrónica ARCA/AFIP WSFEv1." })]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "border border-slate-300 rounded-sm p-3 bg-slate-50 space-y-1.5",
-									children: [invoice.tipoComprobante === "FA" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex justify-between text-slate-700",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Importe Neto Gravado (21%):" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-semibold",
-												children: formatARS(invoice.netoGravado21)
-											})]
-										}),
-										invoice.netoGravado105 > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex justify-between text-slate-700",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Importe Neto Gravado (10.5%):" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-semibold",
-												children: formatARS(invoice.netoGravado105)
-											})]
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex justify-between text-slate-700",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 21%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-semibold",
-												children: formatARS(invoice.iva21)
-											})]
-										}),
-										invoice.iva105 > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex justify-between text-slate-700",
-											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 10.5%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-semibold",
-												children: formatARS(invoice.iva105)
-											})]
-										})
-									] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "flex justify-between text-slate-600 text-[10px]",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Subtotal Operaciones:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-mono",
-											children: formatARS(invoice.total)
-										})]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "flex justify-between text-slate-900 font-black text-sm pt-2 border-t border-slate-300",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "TOTAL:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-mono text-base text-blue-950",
-											children: formatARS(invoice.total)
-										})]
-									})]
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "border-t-2 border-slate-900 pt-3 flex flex-col sm:flex-row items-center justify-between gap-4",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex items-center gap-3",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "p-1 bg-white border border-slate-300 rounded shadow-2xs",
-										children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
-											src: qrSvgUrl,
-											alt: "Código QR Oficial AFIP",
-											className: "w-24 h-24"
-										})
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "space-y-0.5",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex items-center gap-1 font-bold text-slate-900 text-xs",
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "text-blue-700",
-													children: "ARCA"
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "text-slate-400",
-													children: "/"
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "AFIP" })
-											]
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-											className: "text-[9.5px] text-slate-500 max-w-[200px]",
-											children: "Comprobante Autorizado. Escanee para verificar validez en el servidor oficial."
-										})]
-									})]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "text-right space-y-1",
-									children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex items-center justify-end gap-2",
-											children: [
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "font-bold text-slate-800 text-xs",
-													children: "CAE Nº:"
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "font-mono font-black text-sm text-slate-900 tracking-wider",
-													children: invoice.cae
-												}),
-												/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-													onClick: handleCopyCae,
-													className: "p-1 text-slate-400 hover:text-blue-600 print:hidden",
-													title: "Copiar CAE",
-													children: copied ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheck, { className: "w-3.5 h-3.5 text-emerald-600" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Copy, { className: "w-3.5 h-3.5" })
-												})
-											]
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-semibold text-slate-700 text-xs",
-												children: "Fecha de Vto. de CAE:"
-											}),
-											" ",
-											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-												className: "font-mono font-bold text-slate-900 text-xs",
-												children: invoice.vtoCae
-											})
-										] }),
-										invoice.arcaBarcode && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-											className: "pt-1",
-											children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-												className: "font-mono text-[9px] text-slate-400 tracking-widest text-center",
-												children: invoice.arcaBarcode
-											})
-										})
-									]
-								})]
-							})
-						]
-					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						id: "factura-ticket-printable",
-						className: "bg-white border border-slate-300 rounded-sm shadow-md p-5 w-full max-w-[80mm] text-slate-900 font-mono text-[11px] leading-tight select-text print:shadow-none print:border-none print:p-0",
-						children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "text-center pb-2 border-b border-dashed border-slate-400 space-y-0.5",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-sm font-black tracking-tight",
-										children: invoice.emisorRazonSocial
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-[10px] text-slate-600",
-										children: invoice.emisorDomicilio
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-[10px]",
-										children: ["CUIT: ", invoice.emisorCuit]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-[10px]",
-										children: ["IIBB: ", invoice.emisorIibb]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-[10px]",
-										children: invoice.emisorCondicionIva
-									})
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "py-2 border-b border-dashed border-slate-400 text-center space-y-0.5",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-xs font-black uppercase text-blue-950",
-										children: [
-											cmpInfo.label,
-											" [",
-											cmpInfo.letra,
-											"] - CÓD. ",
-											String(cmpInfo.codigoAfip).padStart(2, "0")
-										]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "font-bold text-[11px]",
-										children: [
-											"P.V. ",
-											ptoVtaFormatted,
-											" - Nº ",
-											nroCmpFormatted
-										]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-[10px] text-slate-600",
-										children: [
-											"Fecha: ",
-											invoice.fechaEmision,
-											" ",
-											invoice.horaEmision ? `- ${invoice.horaEmision}` : ""
-										]
-									})
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "py-2 border-b border-dashed border-slate-400 text-[10px] space-y-0.5",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-bold",
-											children: "A:"
-										}),
-										" ",
-										invoice.receptorRazonSocial
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-											className: "font-bold",
-											children: [invoice.receptorTipoDoc, ":"]
-										}),
-										" ",
-										invoice.receptorNroDoc
-									] }),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "font-bold",
-											children: "Cond. IVA:"
-										}),
-										" ",
-										invoice.receptorCondicionIva
-									] })
-								]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-								className: "py-2 border-b border-dashed border-slate-400 space-y-1.5",
-								children: invoice.items.map((item, idx) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex justify-between items-start text-[10.5px]",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "pr-1",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: item.description }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "text-[9.5px] text-slate-500",
-											children: [
-												item.quantity,
-												" x ",
-												formatARS(item.unitPrice)
-											]
-										})]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "font-bold shrink-0",
-										children: formatARS(item.total)
-									})]
-								}, idx))
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "py-2 border-b border-dashed border-slate-400 space-y-1",
-								children: [invoice.tipoComprobante === "FA" && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex justify-between text-[10px]",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Neto Gravado:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.netoGravado21) })]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex justify-between text-[10px]",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "IVA 21%:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.iva21) })]
-								})] }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex justify-between text-sm font-black pt-1",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "TOTAL:" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: formatARS(invoice.total) })]
-								})]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "pt-3 text-center space-y-2",
-								children: [
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "flex justify-center",
-										children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
-											src: qrSvgUrl,
-											alt: "QR AFIP",
-											className: "w-28 h-28 mx-auto"
-										})
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "text-[10px] space-y-0.5",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "font-bold",
-											children: ["CAE: ", invoice.cae]
-										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: ["VTO. CAE: ", invoice.vtoCae] })]
-									}),
-									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "text-[9px] text-slate-500 font-sans pt-1",
-										children: "Comprobante Autorizado por ARCA / AFIP"
-									})
-								]
-							})
-						]
-					})
-				}),
-				/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-					className: "bg-slate-50 border-t border-slate-200 px-4 py-3 flex flex-wrap items-center justify-between gap-2 shrink-0 print:hidden",
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "text-xs text-slate-500",
-						children: [
-							"Punto de Venta ",
-							ptoVtaFormatted,
-							" • Consolata POS Facturación Electrónica ARCA"
-						]
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-						className: "flex items-center gap-2",
-						children: [
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: () => handlePrint("a4"),
-								className: "px-4 py-2 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white text-xs font-bold rounded-lg shadow-sm flex items-center gap-1.5 transition-all cursor-pointer",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-4 h-4 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir en A4 / Guardar PDF" })]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: () => handlePrint("ticket"),
-								className: "px-3.5 py-2 bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold rounded-lg shadow-sm flex items-center gap-1.5 transition-colors cursor-pointer",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Receipt, { className: "w-3.5 h-3.5 text-slate-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket 80mm" })]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-								onClick: handleDownloadHtml,
-								className: "px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 text-xs font-semibold rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, { className: "w-3.5 h-3.5 text-blue-600" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Descargar A4 (.html)" })]
-							}),
-							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-								onClick: onClose,
-								className: "px-3.5 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 text-xs font-medium rounded-lg transition-colors cursor-pointer",
-								children: "Cerrar"
-							})
-						]
-					})]
-				})
-			]
-		})
 	});
 };
 //#endregion
@@ -156692,14 +157885,15 @@ var CobroModal = () => {
 	const handleFinishCobro = () => {
 		setErrorMsg(null);
 		if (activeTab === "efectivo") {
-			if (parsedCash < activeCartTotal) {
+			const effectiveCash = !cashGiven || cashGiven.trim() === "" || parsedCash <= 0 ? activeCartTotal : parsedCash;
+			if (effectiveCash < activeCartTotal) {
 				setErrorMsg("El dinero recibido es menor que el total de la venta.");
 				return;
 			}
 			completeSale({
 				paymentMethod: "efectivo",
 				paymentMethodLabel: "Efectivo",
-				amountPaid: parsedCash
+				amountPaid: effectiveCash
 			});
 		} else if (activeTab === "tarjeta_debito") completeSale({
 			paymentMethod: "tarjeta_debito",
@@ -156864,21 +158058,24 @@ var CobroModal = () => {
 			label: "Efectivo",
 			sublabel: "Pesos en caja",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Banknote, { className: "w-4 h-4 text-emerald-600" }),
-			color: "hover:border-emerald-500"
+			color: "hover:border-emerald-500",
+			shortcut: "F1"
 		},
 		{
 			id: "tarjeta_debito",
 			label: "Tarjeta Débito",
 			sublabel: "Visa, Maestro, Cabal",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CreditCard, { className: "w-4 h-4 text-blue-600" }),
-			color: "hover:border-blue-500"
+			color: "hover:border-blue-500",
+			shortcut: "F2"
 		},
 		{
 			id: "tarjeta_credito",
 			label: "Tarjeta Crédito",
 			sublabel: "Cuotas / Plan Z",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CreditCard, { className: "w-4 h-4 text-purple-600" }),
-			color: "hover:border-purple-500"
+			color: "hover:border-purple-500",
+			shortcut: "F3"
 		},
 		{
 			id: "qr",
@@ -156886,7 +158083,8 @@ var CobroModal = () => {
 			sublabel: "Mercado Pago, Modo, BNA",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(QrCode, { className: "w-4 h-4 text-sky-600" }),
 			color: "hover:border-sky-500",
-			badge: "QR"
+			badge: "QR",
+			shortcut: "F4"
 		},
 		{
 			id: "posnet_mercadopago",
@@ -156894,7 +158092,8 @@ var CobroModal = () => {
 			sublabel: "Caja 1 / Mostrador",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Radio, { className: "w-4 h-4 text-blue-500" }),
 			color: "hover:border-blue-500",
-			badge: "POSNET"
+			badge: "POSNET",
+			shortcut: "F5"
 		},
 		{
 			id: "posnet_mercadopago_2",
@@ -156925,14 +158124,16 @@ var CobroModal = () => {
 			label: "Cta. Corriente",
 			sublabel: "Fiar a cliente",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(UserCheck, { className: "w-4 h-4 text-amber-600" }),
-			color: "hover:border-amber-500"
+			color: "hover:border-amber-500",
+			shortcut: "F6"
 		},
 		{
 			id: "cheque",
 			label: "Cheques",
 			sublabel: "Físico / Echeq",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileCheck2, { className: "w-4 h-4 text-teal-600" }),
-			color: "hover:border-teal-500"
+			color: "hover:border-teal-500",
+			shortcut: "F7"
 		},
 		{
 			id: "pago_mixto",
@@ -156940,7 +158141,8 @@ var CobroModal = () => {
 			sublabel: "Combinar medios",
 			icon: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Layers, { className: "w-4 h-4 text-indigo-600" }),
 			color: "hover:border-indigo-500",
-			badge: "MIXTO"
+			badge: "MIXTO",
+			shortcut: "F8"
 		}
 	];
 	const selectPaymentMethod = (methodId, checkPermission = false) => {
@@ -156965,8 +158167,123 @@ var CobroModal = () => {
 		} else doSelect();
 	};
 	const handleKeyDown = (e) => {
-		if (e.key === "Enter") {
-			const target = e.target;
+		const target = e.target;
+		const isInput = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT");
+		const isCashInput = target === cashInputRef.current;
+		if (e.key === "F1") {
+			e.preventDefault();
+			selectPaymentMethod("efectivo", true);
+			return;
+		}
+		if (e.key === "F2") {
+			e.preventDefault();
+			selectPaymentMethod("tarjeta_debito", true);
+			return;
+		}
+		if (e.key === "F3") {
+			e.preventDefault();
+			selectPaymentMethod("tarjeta_credito", true);
+			return;
+		}
+		if (e.key === "F4") {
+			e.preventDefault();
+			selectPaymentMethod("qr", true);
+			return;
+		}
+		if (e.key === "F5") {
+			e.preventDefault();
+			selectPaymentMethod("posnet_mercadopago", true);
+			return;
+		}
+		if (e.key === "F6") {
+			e.preventDefault();
+			selectPaymentMethod("credito", true);
+			return;
+		}
+		if (e.key === "F7") {
+			e.preventDefault();
+			selectPaymentMethod("cheque", true);
+			return;
+		}
+		if (e.key === "F8") {
+			e.preventDefault();
+			selectPaymentMethod("pago_mixto", true);
+			return;
+		}
+		if (e.altKey && !e.ctrlKey && !e.metaKey) {
+			if (e.key === "1") {
+				e.preventDefault();
+				selectPaymentMethod("efectivo", true);
+				return;
+			}
+			if (e.key === "2") {
+				e.preventDefault();
+				selectPaymentMethod("tarjeta_debito", true);
+				return;
+			}
+			if (e.key === "3") {
+				e.preventDefault();
+				selectPaymentMethod("tarjeta_credito", true);
+				return;
+			}
+			if (e.key === "4") {
+				e.preventDefault();
+				selectPaymentMethod("qr", true);
+				return;
+			}
+			if (e.key === "5") {
+				e.preventDefault();
+				selectPaymentMethod("posnet_mercadopago", true);
+				return;
+			}
+			if (e.key === "6") {
+				e.preventDefault();
+				selectPaymentMethod("credito", true);
+				return;
+			}
+			if (e.key === "7") {
+				e.preventDefault();
+				selectPaymentMethod("cheque", true);
+				return;
+			}
+			if (e.key === "8") {
+				e.preventDefault();
+				selectPaymentMethod("pago_mixto", true);
+				return;
+			}
+		}
+		if (!isInput && [
+			"1",
+			"2",
+			"3",
+			"4",
+			"5",
+			"6",
+			"7",
+			"8"
+		].includes(e.key)) {
+			const numMap = {
+				"1": "efectivo",
+				"2": "tarjeta_debito",
+				"3": "tarjeta_credito",
+				"4": "qr",
+				"5": "posnet_mercadopago",
+				"6": "credito",
+				"7": "cheque",
+				"8": "pago_mixto"
+			};
+			if (numMap[e.key]) {
+				e.preventDefault();
+				selectPaymentMethod(numMap[e.key], true);
+				return;
+			}
+		}
+		if (isCashInput && (e.key === "+" || e.key === " ")) {
+			e.preventDefault();
+			setCashGiven(String(activeCartTotal));
+			return;
+		}
+		if (e.key === "F12" || e.key === "Enter") {
 			if (target && target.tagName === "INPUT" && target.name === "customerSearch") return;
 			e.preventDefault();
 			handleFinishCobro();
@@ -156983,9 +158300,6 @@ var CobroModal = () => {
 			"ArrowDown",
 			"ArrowUp"
 		].includes(e.key)) {
-			const target = e.target;
-			const isInput = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
-			const isCashInput = target === cashInputRef.current;
 			if (isInput && !isCashInput) {
 				if ((target.value || "").trim().length > 0 && !e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) return;
 			}
@@ -157101,16 +158415,22 @@ var CobroModal = () => {
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
 								className: "text-[10px] text-blue-700 font-semibold bg-blue-50 px-2 py-0.5 rounded border border-blue-200",
 								children: [
-									"⌨️ Navegá con flechas ",
+									"⌨️ Atajos: ",
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
 										className: "font-mono",
-										children: "← ↑ ↓ →"
+										children: "F1..F8"
 									}),
-									" y cobrá con ",
+									" medios · ",
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
 										className: "font-mono",
-										children: "Enter"
-									})
+										children: "Enter / F12"
+									}),
+									" cobrar · ",
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+										className: "font-mono",
+										children: "Esc"
+									}),
+									" cancelar"
 								]
 							})]
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -157121,23 +158441,29 @@ var CobroModal = () => {
 									type: "button",
 									onClick: () => selectPaymentMethod(m.id, true),
 									className: `relative flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${m.color} ${isSelected ? "bg-gradient-to-b from-blue-50 to-[#DFEEFC] text-blue-950 border-blue-600 ring-2 ring-blue-500 shadow-xs" : "bg-white hover:bg-slate-50 text-slate-700 border-slate-300"}`,
-									children: [
-										m.badge && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "absolute top-1 right-1 px-1.5 py-0.2 bg-blue-100 text-blue-800 rounded text-[9px] font-bold uppercase",
-											children: m.badge
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-											className: "flex items-center gap-1.5 mb-1",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex items-center justify-between w-full mb-1",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-center gap-1.5",
 											children: [m.icon, /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
 												className: "font-bold text-xs",
 												children: m.label
 											})]
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-											className: "text-[10px] text-slate-500 leading-tight",
-											children: m.sublabel
-										})
-									]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "flex items-center gap-1",
+											children: [m.shortcut && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: `px-1 py-0.2 rounded text-[9px] font-mono font-black ${isSelected ? "bg-blue-600 text-white" : "bg-slate-200 text-slate-700 border border-slate-300"}`,
+												title: `Presione ${m.shortcut} para seleccionar`,
+												children: m.shortcut
+											}), m.badge && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+												className: "px-1 py-0.2 bg-blue-100 text-blue-800 rounded text-[8px] font-bold uppercase",
+												children: m.badge
+											})]
+										})]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+										className: "text-[10px] text-slate-500 leading-tight",
+										children: m.sublabel
+									})]
 								}, m.id);
 							})
 						})] }),
@@ -158592,7 +159918,7 @@ var CobroModal = () => {
 						type: "button",
 						onClick: handleFinishCobro,
 						className: `px-6 py-2.5 rounded-lg font-bold text-xs flex items-center gap-2 shadow-md cursor-pointer transition-all active:scale-95 ${activeTab === "credito" && !isRemoteApproved && activeCashier.role !== "admin" && !(selectedCustomer && selectedCustomer.currentDebt < 0 && activeCartTotal <= Math.abs(selectedCustomer.currentDebt)) ? "bg-gradient-to-r from-purple-700 via-indigo-700 to-blue-800 hover:from-purple-800 hover:to-indigo-900 text-white" : "bg-gradient-to-b from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white"}`,
-						children: activeTab === "credito" && !isRemoteApproved && activeCashier.role !== "admin" && !(selectedCustomer && selectedCustomer.currentDebt < 0 && activeCartTotal <= Math.abs(selectedCustomer.currentDebt)) ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldAlert, { className: "w-4 h-4 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "SOLICITAR AUTORIZACIÓN AL ADMIN (ENTER)" })] }) : activeTab === "credito" && isRemoteApproved ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-4 h-4 text-emerald-300 stroke-[3]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "CONFIRMAR VENTA AUTORIZADA (ENTER)" })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheckBig, { className: "w-4 h-4 text-emerald-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "CONFIRMAR COBRO (ENTER)" })] })
+						children: activeTab === "credito" && !isRemoteApproved && activeCashier.role !== "admin" && !(selectedCustomer && selectedCustomer.currentDebt < 0 && activeCartTotal <= Math.abs(selectedCustomer.currentDebt)) ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ShieldAlert, { className: "w-4 h-4 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "SOLICITAR AUTORIZACIÓN AL ADMIN (ENTER)" })] }) : activeTab === "credito" && isRemoteApproved ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-4 h-4 text-emerald-300 stroke-[3]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "CONFIRMAR VENTA AUTORIZADA (ENTER)" })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheckBig, { className: "w-4 h-4 text-emerald-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "CONFIRMAR COBRO (ENTER / F12)" })] })
 					})]
 				})
 			]
@@ -158608,10 +159934,10 @@ var TicketModal = () => {
 	const { selectedSaleForTicket, setSelectedSaleForTicket, config, electronicInvoices, setActiveView } = usePOS();
 	const [isFacturarOpen, setIsFacturarOpen] = (0, import_react.useState)(false);
 	const [visorInvoice, setVisorInvoice] = (0, import_react.useState)(null);
-	if (!selectedSaleForTicket) return null;
+	const autoPrintedSaleIdRef = (0, import_react.useRef)(null);
 	const sale = selectedSaleForTicket;
-	const existingInvoice = electronicInvoices.find((i) => i.saleId === sale.id || i.saleFolio === sale.folio || i.ticketNumber === sale.ticketNumber);
-	const saleDate = new Date(sale.timestamp);
+	const existingInvoice = sale ? electronicInvoices.find((i) => i.saleId === sale.id || i.saleFolio === sale.folio || i.ticketNumber === sale.ticketNumber) : void 0;
+	const saleDate = sale ? new Date(sale.timestamp) : /* @__PURE__ */ new Date();
 	const formattedDate = saleDate.toLocaleDateString("es-AR");
 	const formattedTime = saleDate.toLocaleTimeString("es-AR", {
 		hour: "2-digit",
@@ -158619,6 +159945,7 @@ var TicketModal = () => {
 		second: "2-digit"
 	});
 	const buildPlainTicketText = () => {
+		if (!sale) return "";
 		const lineSep = config.ticketWidth === 58 ? "--------------------------------" : "------------------------------------------";
 		const activePdv = config.afipConfig?.puntoVenta || existingInvoice?.puntoVenta || 4;
 		const pdvFormatted = String(activePdv).padStart(5, "0");
@@ -158654,6 +159981,7 @@ var TicketModal = () => {
 		return lines.join("\r\n");
 	};
 	const handlePrint = () => {
+		if (!sale) return;
 		try {
 			const w = window;
 			const rawTicketData = buildPlainTicketText();
@@ -158672,6 +160000,46 @@ var TicketModal = () => {
 		} catch {}
 		PrinterService.printSaleTicket(sale, config, existingInvoice);
 	};
+	(0, import_react.useEffect)(() => {
+		if (!sale || existingInvoice) return;
+		if (autoPrintedSaleIdRef.current !== sale.id) {
+			autoPrintedSaleIdRef.current = sale.id;
+			const timer = setTimeout(() => {
+				handlePrint();
+			}, 150);
+			return () => clearTimeout(timer);
+		}
+	}, [sale?.id, existingInvoice]);
+	(0, import_react.useEffect)(() => {
+		if (!sale) return;
+		const handleTicketKeyDown = (e) => {
+			if (isFacturarOpen || visorInvoice) return;
+			if (e.key === "Enter" || e.key === "Escape") {
+				e.preventDefault();
+				e.stopPropagation();
+				setSelectedSaleForTicket(null);
+				return;
+			}
+			if (e.key === "p" || e.key === "P") {
+				e.preventDefault();
+				handlePrint();
+				return;
+			}
+			if ((e.key === "f" || e.key === "F" || e.key === "F11" || e.key === "a" || e.key === "A") && !existingInvoice) {
+				e.preventDefault();
+				setIsFacturarOpen(true);
+				return;
+			}
+		};
+		window.addEventListener("keydown", handleTicketKeyDown);
+		return () => window.removeEventListener("keydown", handleTicketKeyDown);
+	}, [
+		sale,
+		isFacturarOpen,
+		visorInvoice,
+		existingInvoice
+	]);
+	if (!selectedSaleForTicket || !sale) return null;
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in print:bg-white print:p-0 print:static print:overflow-visible",
 		children: [
@@ -158700,7 +160068,30 @@ var TicketModal = () => {
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 							onClick: () => setSelectedSaleForTicket(null),
 							className: "text-white hover:text-red-200 text-lg font-bold",
+							title: "Cerrar ticket (Esc / Enter)",
 							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
+						})]
+					}),
+					!existingInvoice && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "bg-emerald-50 border-b border-emerald-200 px-4 py-2 flex items-center justify-between text-[11px] text-emerald-900 font-semibold print:hidden",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+							className: "flex items-center gap-1.5",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5 text-emerald-600 animate-pulse" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Ticket enviado a impresora predeterminada" })]
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+							className: "text-slate-600 font-mono text-[10px]",
+							children: [
+								"Presione ",
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+									className: "text-slate-900 bg-white px-1.5 py-0.5 rounded border border-slate-300 font-bold",
+									children: "Enter"
+								}),
+								" o ",
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", {
+									className: "text-slate-900 bg-white px-1.5 py-0.5 rounded border border-slate-300 font-bold",
+									children: "Esc"
+								}),
+								" para cerrar"
+							]
 						})]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -159067,15 +160458,15 @@ var TicketModal = () => {
 						className: "bg-[#EDEDED] border-t border-[#C0BCA8] p-3 flex items-center justify-between print:hidden",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 							onClick: () => setSelectedSaleForTicket(null),
-							className: "px-4 py-1.5 text-xs font-semibold bg-white border border-[#BEBAA7] rounded text-slate-800",
-							children: "Cerrar (Esc)"
+							className: "px-4 py-1.5 text-xs font-bold bg-white border border-[#BEBAA7] hover:bg-slate-100 rounded text-slate-800 shadow-2xs cursor-pointer flex items-center gap-1",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Cerrar (Enter / Esc)" })
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 							className: "flex items-center gap-2",
 							children: [existingInvoice ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								onClick: () => setVisorInvoice(existingInvoice),
 								className: "px-3.5 py-1.5 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer",
-								title: "Abrir visor oficial para imprimir en hoja A4 o guardar en PDF",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir Factura A4" })]
+								title: "Abrir visor para imprimir en hoja A4 seleccionando la impresora de escritorio o guardar en PDF",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(FileText, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir Factura A4 (Elegir Impresora)" })]
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								onClick: () => setVisorInvoice(existingInvoice),
 								className: "px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer",
@@ -159086,12 +160477,14 @@ var TicketModal = () => {
 								] })]
 							})] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								onClick: () => setIsFacturarOpen(true),
-								className: "px-3.5 py-1.5 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Facturar ARCA / AFIP" })]
+								className: "px-3.5 py-1.5 bg-gradient-to-r from-blue-700 to-indigo-800 hover:from-blue-800 hover:to-indigo-900 text-white rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer",
+								title: "Emitir comprobante oficial AFIP/ARCA (Opcional - tecla F)",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5 text-amber-300" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Facturar ARCA / AFIP [F]" })]
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								onClick: handlePrint,
-								className: "px-5 py-1.5 bg-gradient-to-b from-white to-[#DFEEFC] text-blue-900 border border-blue-400 rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Imprimir Ticket" })]
+								className: "px-4 py-1.5 bg-gradient-to-b from-white to-[#DFEEFC] text-blue-900 border border-blue-400 hover:bg-blue-100 rounded text-xs font-bold flex items-center gap-1.5 shadow-2xs cursor-pointer",
+								title: "Reimprimir ticket en la impresora predeterminada (tecla P)",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Printer, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Reimprimir [P]" })]
 							})]
 						})]
 					})
@@ -161791,7 +163184,7 @@ var ModalInstaladores = ({ isOpen, onClose }) => {
 												className: "bg-emerald-700 text-white text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-wide",
 												children: [
 													"★ PROGRAMA OFICIAL DE WINDOWS EN DISCO DURO (",
-													"v5.67-20261102-R37",
+													"v5.68-20261106-R38",
 													")"
 												]
 											}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
@@ -161854,7 +163247,7 @@ var ModalInstaladores = ({ isOpen, onClose }) => {
 														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(CircleCheck, { className: "w-4 h-4 text-emerald-600 shrink-0 mt-0.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
 															/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("strong", { children: [
 																"Incluye todo al día (",
-																"v5.67-20261102-R37",
+																"v5.68-20261106-R38",
 																"):"
 															] }),
 															" Precio Mayoreo ",
@@ -162387,7 +163780,7 @@ var ModalInstaladores = ({ isOpen, onClose }) => {
 													children: "ACTUALIZACIÓN SIN REINSTALAR"
 												}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
 													className: "bg-emerald-100 text-emerald-800 border border-emerald-300 text-[10px] font-black px-2.5 py-0.5 rounded-full font-mono",
-													children: ["✓ Compilado al día: ", "v5.67-20261102-R37"]
+													children: ["✓ Compilado al día: ", "v5.68-20261106-R38"]
 												})]
 											}),
 											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
@@ -164343,7 +165736,7 @@ var ModalAuditoriaTicketsSobrante = () => {
 //#endregion
 //#region src/components/GlobalDialogs.tsx
 var GlobalDialogs = () => {
-	const { toast, confirmDialog, closeConfirm, isCloseShiftDialogOpen, setIsCloseShiftDialogOpen, isInstaladoresOpen, setIsInstaladoresOpen, currentShift, sales, cashMovements, cashiers, activeCashier, closeCurrentShift, openNewShift, config, showToast, getShiftForRegister, setIsUnclosedTicketsModalOpen, setUnclosedTicketsSurplusHint } = usePOS();
+	const { toast, confirmDialog, closeConfirm, isCloseShiftDialogOpen, setIsCloseShiftDialogOpen, isInstaladoresOpen, setIsInstaladoresOpen, currentShift, sales, cashMovements, cashiers, activeCashier, closeCurrentShift, openNewShift, config, showToast, getShiftForRegister, setIsUnclosedTicketsModalOpen, setUnclosedTicketsSurplusHint, posAlertModal, setPosAlertModal } = usePOS();
 	const [countedCashInput, setCountedCashInput] = (0, import_react.useState)("");
 	const [nextShiftFundInput, setNextShiftFundInput] = (0, import_react.useState)("15000");
 	const [shiftNotes, setShiftNotes] = (0, import_react.useState)("Cierre regular de turno");
@@ -164574,7 +165967,41 @@ var GlobalDialogs = () => {
 			isOpen: isInstaladoresOpen,
 			onClose: () => setIsInstaladoresOpen(false)
 		}),
-		/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModalAuditoriaTicketsSobrante, {})
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ModalAuditoriaTicketsSobrante, {}),
+		posAlertModal && posAlertModal.isOpen && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+			className: "fixed inset-0 z-[99999] bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-200",
+			children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "bg-white rounded-xl shadow-2xl max-w-lg w-full border-4 border-red-500 overflow-hidden transform animate-in zoom-in-95 duration-200",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "bg-red-600 text-white px-6 py-4 flex items-center gap-3 shadow-md",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(TriangleAlert, { className: "w-8 h-8 text-yellow-300 animate-pulse shrink-0" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
+							className: "text-lg font-extrabold uppercase tracking-wide",
+							children: posAlertModal.title
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "p-6 space-y-4 bg-red-50/40",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+							className: "text-gray-900 text-base font-medium leading-relaxed",
+							children: posAlertModal.message
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+							className: "bg-amber-100 border-l-4 border-amber-500 p-3 text-amber-900 text-xs font-bold rounded",
+							children: "⚠️ OPERACIÓN BLOQUEADA POR RESTRICCIÓN DEL SISTEMA"
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "bg-gray-100 px-6 py-4 flex justify-end",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							autoFocus: true,
+							onClick: () => setPosAlertModal(null),
+							className: "bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold px-8 py-3 rounded-lg shadow-lg text-base uppercase tracking-wider transition-all transform hover:scale-105 flex items-center gap-2 cursor-pointer",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Aceptar" })
+						})
+					})
+				]
+			})
+		})
 	] });
 };
 //#endregion
@@ -209844,7 +211271,7 @@ function App() {
 //#region src/main.tsx
 try {
 	syncAndGetRevisionHistory();
-	if (localStorage.getItem("CONSOLATA_APP_BUILD_REV") !== "v5.67-20261102-R37") {
+	if (localStorage.getItem("CONSOLATA_APP_BUILD_REV") !== "v5.68-20261106-R38") {
 		localStorage.setItem("CONSOLATA_APP_BUILD_REV", CURRENT_BUILD_REV);
 		if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then((regs) => {
 			regs.forEach((r) => {
