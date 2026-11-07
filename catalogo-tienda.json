@@ -2,7 +2,7 @@
   "success": true,
   "apiVersion": "1.0",
   "rev": "v5.68-20261106-R38",
-  "updatedAt": 1794058811212,
+  "updatedAt": 1794059371145,
   "storeConfig": {
     "enabled": true,
     "storeTitle": "LA CONSOLATA LIMPIEZA Y ANEXOS",
@@ -3200,7 +3200,7 @@
       "salePrice": 17000,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 49862.56,
+      "stock": 49862.06,
       "usesInventory": true,
       "sellType": "bulk",
       "unitOfMeasure": "KG"
@@ -9648,7 +9648,7 @@
       "salePrice": 1700,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 0,
+      "stock": 19,
       "usesInventory": true,
       "sellType": "bulk",
       "unitOfMeasure": "KG"
@@ -11923,7 +11923,7 @@
       "salePrice": 2200,
       "wholesalePrice": 1900,
       "wholesaleQuantity": 3,
-      "stock": 50,
+      "stock": 47,
       "usesInventory": true,
       "sellType": "bulk",
       "unitOfMeasure": "KG"
@@ -58339,7 +58339,7 @@
       "salePrice": 11500,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 2,
+      "stock": 1,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -58365,7 +58365,7 @@
       "salePrice": 11500,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 4,
+      "stock": 3,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -85923,7 +85923,7 @@
       "salePrice": 3900,
       "wholesalePrice": 3500,
       "wholesaleQuantity": 3,
-      "stock": 37,
+      "stock": 35,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"
@@ -95976,7 +95976,7 @@
       "salePrice": 9000,
       "wholesalePrice": 0,
       "wholesaleQuantity": 3,
-      "stock": 2,
+      "stock": 0,
       "usesInventory": true,
       "sellType": "unit",
       "unitOfMeasure": "PZA"

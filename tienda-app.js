@@ -54681,14 +54681,16 @@ var envMeta = {
 	"VITE_STORE_ONLY": "Doc35672",
 	"VITE_TIENDA_SLUG": "Doc35672"
 };
+var winEnv = typeof window !== "undefined" && window.__CONSOLATA_ENV__ || {};
+var firebaseConfig = firebase_applet_config_default || {};
 var resolvedFirebaseConfig = {
-	projectId: envMeta.VITE_FIREBASE_PROJECT_ID || firebase_applet_config_default.projectId,
-	appId: envMeta.VITE_FIREBASE_APP_ID || firebase_applet_config_default.appId,
-	apiKey: envMeta.VITE_FIREBASE_API_KEY || firebase_applet_config_default.apiKey,
-	authDomain: envMeta.VITE_FIREBASE_AUTH_DOMAIN || firebase_applet_config_default.authDomain,
-	firestoreDatabaseId: envMeta.VITE_FIREBASE_DATABASE_ID || firebase_applet_config_default.firestoreDatabaseId,
-	storageBucket: envMeta.VITE_FIREBASE_STORAGE_BUCKET || firebase_applet_config_default.storageBucket,
-	messagingSenderId: envMeta.VITE_FIREBASE_MESSAGING_SENDER_ID || firebase_applet_config_default.messagingSenderId
+	projectId: envMeta.VITE_FIREBASE_PROJECT_ID || winEnv.VITE_FIREBASE_PROJECT_ID || firebaseConfig.projectId || "angular-marking-fxctm",
+	appId: envMeta.VITE_FIREBASE_APP_ID || winEnv.VITE_FIREBASE_APP_ID || firebaseConfig.appId || "1:583902617780:web:7c3c93a3b31804bd3a77e1",
+	apiKey: envMeta.VITE_FIREBASE_API_KEY || winEnv.VITE_FIREBASE_API_KEY || firebaseConfig.apiKey || "AIzaSyBJmooQg1-lbRswYU4PhMec5v_FhYhAxh0",
+	authDomain: envMeta.VITE_FIREBASE_AUTH_DOMAIN || winEnv.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfig.authDomain || "angular-marking-fxctm.firebaseapp.com",
+	firestoreDatabaseId: envMeta.VITE_FIREBASE_DATABASE_ID || envMeta.VITE_FIREBASE_FIRESTORE_DATABASE_ID || winEnv.VITE_FIREBASE_FIRESTORE_DATABASE_ID || firebaseConfig.firestoreDatabaseId || "ai-studio-wily10sistemapun-97ebc181-c58a-419d-8470-ded038875878",
+	storageBucket: envMeta.VITE_FIREBASE_STORAGE_BUCKET || winEnv.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket || "angular-marking-fxctm.firebasestorage.app",
+	messagingSenderId: envMeta.VITE_FIREBASE_MESSAGING_SENDER_ID || winEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfig.messagingSenderId || "583902617780"
 };
 var quotaExhaustedTimestamp = 0;
 try {
